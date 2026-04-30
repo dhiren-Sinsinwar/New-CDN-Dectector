@@ -1,0 +1,16 @@
+{
+  "name": "cdn-detector-puppeteer",
+  "version": "1.0.0",
+  "description": "CDN Detector using Puppeteer headless browser",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "puppeteer": "^22.8.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
