@@ -305,6 +305,7 @@ async function crawlSite(browser, rawUrl) {
   if (!url) return {
     cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available',
     matchedUrl: '', confidence: 'Low', detail: 'Invalid URL',
+    reason: 'Invalid or missing URL',
   };
 
   let imageCount   = 0;
@@ -447,7 +448,7 @@ async function crawlSite(browser, rawUrl) {
           await page.goto(http, { waitUntil: 'domcontentloaded', timeout: 12000 });
         } catch (e) {
           await page.close().catch(() => {});
-          return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: `Could not open: ${e.message}` };
+          return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: `Could not open: ${e.message}`, reason: `Could not open site: ${e.message}` };
         }
       }
     }
@@ -486,7 +487,7 @@ async function crawlSite(browser, rawUrl) {
 
   } catch (err) {
     if (page) await page.close().catch(() => {});
-    return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: `Error: ${err.message}` };
+    return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: `Error: ${err.message}`, reason: `Browser error: ${err.message}` };
   }
 
   await page.close().catch(() => {});
@@ -501,6 +502,18 @@ async function crawlSite(browser, rawUrl) {
   const finalDAM  = damFromUrl  || 'Not available';
   const detail    = `${imageCount} images scanned${cdnFromUrl ? ' | CDN URL: '+cdnFromUrl : ''}${serverHeader ? ' | Server: '+serverHeader : ''}${damFromUrl ? ' | DAM: '+damFromUrl : ''}`;
 
+  // ── Reason for "Not available" — shown in the Error/Reason column ───────────
+  let reason = '';
+  if (finalCDN === 'Not available') {
+    if (imageCount === 0) {
+      reason = 'No images loaded — site may have blocked the crawler (bot protection / CAPTCHA)';
+    } else if (imageCount >= MAX_IMAGES) {
+      reason = `Checked ${MAX_IMAGES} images — no Imgix, Cloudinary or known CDN patterns found`;
+    } else {
+      reason = `${imageCount} images scanned — no known CDN or DAM patterns detected in URLs or headers`;
+    }
+  }
+
   // Use matchedUrl if we have one; otherwise fall back to the best real image URL
   // This fills in URLs for sites where CDN was detected from server headers only
   const finalUrl = matchedUrl || bestImageUrl || '';
@@ -512,6 +525,7 @@ async function crawlSite(browser, rawUrl) {
     matchedUrl:  finalUrl,
     confidence,
     detail,
+    reason,
   };
 }
 
@@ -556,7 +570,7 @@ app.post('/crawl-stream', async (req, res) => {
             .catch(err => {
               done++;
               active.delete(item.i);
-              send({ type: 'result', index: item.i, company: item.company, website: item.url, cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, done, total: entries.length });
+              send({ type: 'result', index: item.i, company: item.company, website: item.url, cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message, done, total: entries.length });
               if (queue.length === 0 && active.size === 0) resolve(); else next();
             });
         }
@@ -599,7 +613,7 @@ app.post('/crawl', async (req, res) => {
     const result = await crawlSite(browser, url);
     res.json(result);
   } catch (err) {
-    res.json({ cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message });
+    res.json({ cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message });
   } finally {
     await browser.close().catch(() => {});
   }
