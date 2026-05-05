@@ -3,10 +3,8 @@ nixPkgs = [
   "chromium",
   "nss",
   "freetype",
-  "freetype.dev",
   "harfbuzz",
   "ca-certificates",
-  "ttf-opensans",
   "glib",
   "nspr",
   "atk",
@@ -29,4 +27,4 @@ nixPkgs = [
 
 [variables]
 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "true"
-PUPPETEER_EXECUTABLE_PATH = "/run/current-system/sw/bin/chromium"
+CHROMIUM_PATH = "/run/current-system/sw/bin/chromium"
