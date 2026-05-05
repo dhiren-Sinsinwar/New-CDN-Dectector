@@ -1,0 +1,16 @@
+{
+  "name": "cdn-detector",
+  "version": "1.0.0",
+  "description": "CDN Detector — intercepts image network requests like DevTools Network Img tab",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "puppeteer": "^22.8.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
