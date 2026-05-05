@@ -78,8 +78,8 @@ button.primary.signed{background:#1a7a3a}
 button.ghost{background:transparent;color:var(--accent);border:.5px solid var(--accent);border-radius:7px;padding:6px 14px;font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:background .15s}
 button.ghost:hover{background:rgba(212,245,122,.08)}
 .table-wrap{background:var(--bg2);border:.5px solid var(--border);border-radius:14px;overflow:hidden}
-.table-head{display:grid;grid-template-columns:1.6fr 1.8fr 1.4fr 1fr 2fr;font-size:10.5px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;padding:10px 16px;background:var(--bg3);border-bottom:.5px solid var(--border)}
-.table-row{display:grid;grid-template-columns:1.6fr 1.8fr 1.4fr 1fr 2fr;padding:11px 16px;border-bottom:.5px solid var(--border);align-items:center;font-size:13px;transition:background .1s;animation:rowIn .28s ease both}
+.table-head{display:grid;grid-template-columns:1.4fr 1.4fr 1.2fr 1.2fr 1.2fr .8fr 1.8fr;font-size:10.5px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;padding:10px 16px;background:var(--bg3);border-bottom:.5px solid var(--border)}
+.table-row{display:grid;grid-template-columns:1.4fr 1.4fr 1.2fr 1.2fr 1.2fr .8fr 1.8fr;padding:11px 16px;border-bottom:.5px solid var(--border);align-items:center;font-size:13px;transition:background .1s;animation:rowIn .28s ease both}
 .table-row:last-child{border-bottom:none}
 .table-row:hover{background:var(--bg3)}
 @keyframes rowIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
@@ -218,10 +218,11 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
 
   <!-- Results -->
   <div id="resultsSection" style="display:none">
-    <div class="summary-grid">
+    <div class="summary-grid" style="grid-template-columns:repeat(5,1fr)">
       <div class="sum-card"><div class="sum-label">Scanned</div><div class="sum-val" id="sumTotal">0</div></div>
-      <div class="sum-card"><div class="sum-label">Imgix</div><div class="sum-val v-imgix" id="sumImgix">0</div></div>
-      <div class="sum-card"><div class="sum-label">Cloudinary</div><div class="sum-val v-cloud" id="sumCloud">0</div></div>
+      <div class="sum-card"><div class="sum-label">CDN found</div><div class="sum-val v-imgix" id="sumCDN">0</div></div>
+      <div class="sum-card"><div class="sum-label">DAM found</div><div class="sum-val v-cloud" id="sumDAM">0</div></div>
+      <div class="sum-card"><div class="sum-label">Server ID'd</div><div class="sum-val" style="color:var(--blue)" id="sumServer">0</div></div>
       <div class="sum-card"><div class="sum-label">Not found</div><div class="sum-val v-na" id="sumNA">0</div></div>
     </div>
     <div class="results-hdr">
@@ -229,7 +230,7 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
       <button class="ghost" onclick="exportCSV()">Export CSV</button>
     </div>
     <div class="table-wrap">
-      <div class="table-head"><div>Company</div><div>Website</div><div>CDN</div><div>Confidence</div><div>Detail</div></div>
+      <div class="table-head"><div>Company</div><div>Website</div><div>ID from URL</div><div>Server</div><div>DAM</div><div>Confidence</div><div>Matched URL</div></div>
       <div id="tableBody"></div>
     </div>
     <div class="log-box" id="logBox"></div>
@@ -356,33 +357,68 @@ async function writeToSheet(sheetId,updates){
   if(!r.ok){const e=await r.json();throw new Error(e.error?.message||'Write failed');}
 }
 
-// ── Crawl via parallel SSE stream ────────────────────────────────────────────
-async function crawlAllStream(serverUrl, entries, onProgress, onResult) {
-  const r = await fetch(serverUrl.replace(/\/$/, '') + '/crawl-stream', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ entries }),
-    signal: AbortSignal.timeout(600000) // 10 min total
-  });
-  if (!r.ok) throw new Error(`Server error: ${r.status}`);
+// ── Crawl via parallel SSE stream — with auto-resume on disconnect ───────────
+// Sends entries in batches of 25 so Railway timeout never cuts off the whole run
+const BATCH_SIZE = 25;
 
-  const reader = r.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
+async function crawlAllStream(serverUrl, allEntries, onProgress, onResult) {
+  // Split into batches of 25
+  const batches = [];
+  for (let i = 0; i < allEntries.length; i += BATCH_SIZE) {
+    batches.push(allEntries.slice(i, i + BATCH_SIZE));
+  }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop();
-    for (const line of lines) {
-      if (!line.startsWith('data:')) continue;
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    let retries = 0;
+    const MAX_RETRIES = 3;
+
+    while (retries <= MAX_RETRIES) {
       try {
-        const ev = JSON.parse(line.slice(5).trim());
-        if (ev.type === 'progress') onProgress(ev);
-        if (ev.type === 'result')   onResult(ev);
-      } catch { /* ignore */ }
+        const r = await fetch(serverUrl.replace(/\/$/, '') + '/crawl-stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ entries: batch }),
+          signal: AbortSignal.timeout(480000) // 8 min per batch
+        });
+
+        if (!r.ok) throw new Error(`Server error: ${r.status}`);
+
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop();
+          for (const line of lines) {
+            if (!line.startsWith('data:')) continue;
+            try {
+              const ev = JSON.parse(line.slice(5).trim());
+              if (ev.type === 'progress') onProgress(ev);
+              if (ev.type === 'result')   onResult(ev);
+            } catch { /* ignore */ }
+          }
+        }
+        break; // batch done successfully
+
+      } catch (err) {
+        retries++;
+        if (retries > MAX_RETRIES) {
+          // Mark all unfinished entries in this batch as error
+          batch.forEach(e => {
+            if (!e._done) onResult({ ...e, index: e.index, cdn: 'Not available', confidence: 'Low', detail: 'Connection lost after retries', done: 0, total: allEntries.length });
+          });
+          break;
+        }
+        // Wait 3s then retry the batch
+        setStatus(`Connection dropped — retrying batch ${b+1}/${batches.length}… (attempt ${retries})`, 'running');
+        log(`Connection dropped, retrying batch in 3s… (attempt ${retries}/${MAX_RETRIES})`, 'err');
+        await new Promise(r => setTimeout(r, 3000));
+      }
     }
   }
 }
@@ -401,32 +437,44 @@ function confBadge(c){
   if(!c||c==='—')return '<span class="badge b-pending">—</span>';
   return `<span class="badge b-${c.toLowerCase()}">${esc(c)}</span>`;
 }
-function rowHtml(i,co,web,cdn,conf,detail){
+function serverBadge(s){
+  if(!s)return '<span style="color:var(--muted);font-size:11px">—</span>';
+  return `<span style="font-size:11px;color:var(--muted2)">${esc(s.slice(0,30))}</span>`;
+}
+function damBadge(d){
+  if(!d||d==='Not available')return '<span class="badge b-na">—</span>';
+  return `<span class="badge" style="background:#1a0a30;color:#c4b5fd;border:.5px solid #3a2a6a;font-size:10px">${esc(d)}</span>`;
+}
+function rowHtml(i,co,web,cdn,server,dam,conf,mUrl){
+  const shortUrl = mUrl ? mUrl.slice(0,50)+(mUrl.length>50?'…':'') : '—';
   return `<div class="table-row" id="row-${i}" style="animation-delay:${Math.min(i*25,350)}ms">
     <div class="c-co" title="${esc(co)}">${esc(co)}</div>
     <div class="c-web" title="${esc(web)}">${esc(web)}</div>
     <div>${cdnBadge(cdn)}</div>
+    <div>${serverBadge(server)}</div>
+    <div>${damBadge(dam)}</div>
     <div>${confBadge(conf)}</div>
-    <div class="c-detail" title="${esc(detail||'')}">${esc(detail||'')}</div>
+    <div class="c-detail" title="${esc(mUrl||'')}">${shortUrl}</div>
   </div>`;
 }
-function updateRow(i,co,web,cdn,conf,detail){
+function updateRow(i,co,web,cdn,server,dam,conf,mUrl){
   const el=document.getElementById('row-'+i);
-  const html=rowHtml(i,co,web,cdn,conf,detail);
+  const html=rowHtml(i,co,web,cdn,server,dam,conf,mUrl);
   if(el)el.outerHTML=html;else document.getElementById('tableBody').insertAdjacentHTML('beforeend',html);
 }
 function updateSummary(){
-  let imgix=0,cloud=0,na=0;
+  let cdn=0,dam=0,svr=0,na=0;
   results.forEach(r=>{
     if(!r)return;
-    const l=(r.cdn||'').toLowerCase();
-    if(l.includes('imgix'))imgix++;
-    if(l.includes('cloud'))cloud++;
-    if(l==='not available')na++;
+    if(r.cdnFromUrl && r.cdnFromUrl!=='Not available') cdn++;
+    if(r.damFromUrl && r.damFromUrl!=='Not available') dam++;
+    if(r.server) svr++;
+    if((!r.cdnFromUrl||r.cdnFromUrl==='Not available')&&(!r.server)&&(!r.damFromUrl||r.damFromUrl==='Not available')) na++;
   });
   document.getElementById('sumTotal').textContent=results.filter(Boolean).length;
-  document.getElementById('sumImgix').textContent=imgix;
-  document.getElementById('sumCloud').textContent=cloud;
+  document.getElementById('sumCDN').textContent=cdn;
+  document.getElementById('sumDAM').textContent=dam;
+  document.getElementById('sumServer').textContent=svr;
   document.getElementById('sumNA').textContent=na;
 }
 
@@ -470,52 +518,70 @@ async function run(){
 
   const entries=rows.slice(1).filter(r=>r[websiteIdx]).map((r,i)=>({row:i+2,company:r[companyIdx]||'',website:r[websiteIdx]||''}));
   document.getElementById('sumTotal').textContent=entries.length;
-  entries.forEach((e,i)=>updateRow(i,e.company,e.website,'…','—','Queued…'));
+  entries.forEach((e,i)=>updateRow(i,e.company,e.website,'…','','','—',''));
 
-  let cdnCol=header.findIndex(h=>/imgix.?cloudinary|cdn/i.test(h));
-  let confCol=header.findIndex(h=>/confidence/i.test(h));
+  let cdnCol    = header.findIndex(h=>/identification.*url|imgix.?cloudinary|cdn/i.test(h));
+  let serverCol = header.findIndex(h=>/^server$/i.test(h));
+  let damCol    = header.findIndex(h=>/^dam$/i.test(h));
+  let confCol   = header.findIndex(h=>/confidence/i.test(h));
+  let urlCol    = header.findIndex(h=>/^url$/i.test(h));
   const newHeader=[...header];
-  if(cdnCol===-1){cdnCol=newHeader.length;newHeader.push('Imgix/Cloudinary');}
-  if(confCol===-1){confCol=newHeader.length;newHeader.push('Confidence Score');}
+  if(cdnCol===-1)   {cdnCol=newHeader.length;    newHeader.push('Identification from URL');}
+  if(serverCol===-1){serverCol=newHeader.length;  newHeader.push('Server');}
+  if(damCol===-1)   {damCol=newHeader.length;     newHeader.push('DAM');}
+  if(confCol===-1)  {confCol=newHeader.length;    newHeader.push('Confidence Score');}
+  if(urlCol===-1)   {urlCol=newHeader.length;     newHeader.push('URL');}
 
   const sheetUpdates=[];
   // Stream results in parallel — 4 sites crawled simultaneously
   await crawlAllStream(
     serverUrl,
-    entries.map(e => ({ company: e.company, url: e.website })),
+    entries.map((e, i) => ({ company: e.company, url: e.website, index: i })),
     // onProgress
     (ev) => {
       setStatus(`Scanning ${ev.company}…`, 'running', `${ev.done||0} / ${entries.length}`);
-      updateRow(ev.index, ev.company, entries[ev.index].website, '…', '—', 'Scanning…');
+      updateRow(ev.index, ev.company, entries[ev.index].website, '…', '', '', '—', '');
     },
     // onResult
     (ev) => {
-      const cdn        = ev.cdn        || 'Not available';
-      const confidence = ev.confidence || 'Low';
-      const detail     = ev.detail     || '';
-      results[ev.index] = { company: ev.company, website: entries[ev.index].website, cdn, confidence, detail };
-      updateRow(ev.index, ev.company, entries[ev.index].website, cdn, confidence, detail);
+      const cdnFromUrl  = ev.cdnFromUrl  || 'Not available';
+      const server      = ev.server      || '';
+      const damFromUrl  = ev.damFromUrl  || 'Not available';
+      const confidence  = ev.confidence  || 'Low';
+      const matchedUrl  = ev.matchedUrl  || '';
+      results[ev.index] = { company: ev.company, website: entries[ev.index].website, cdnFromUrl, server, damFromUrl, confidence, matchedUrl };
+      updateRow(ev.index, ev.company, entries[ev.index].website, cdnFromUrl, server, damFromUrl, confidence, matchedUrl);
       updateSummary();
       setProgress(ev.done, ev.total, `Done: ${ev.company}`);
       setStatus(`Scanning… (${ev.done}/${ev.total})`, 'running', `${ev.done} / ${ev.total}`);
-      log(`${ev.company}: ${cdn} (${confidence}) — ${detail}`, cdn === 'Not available' ? 'err' : 'ok');
+      const found = cdnFromUrl!=='Not available'||server||damFromUrl!=='Not available';
+      log(`${ev.company}: CDN=${cdnFromUrl} | Server=${server||'—'} | DAM=${damFromUrl}`, found?'ok':'err');
       const entry = entries[ev.index];
       sheetUpdates.push({
-        range: `Sheet1!${colLetter(cdnCol)}${entry.row}:${colLetter(confCol)}${entry.row}`,
-        values: [[cdn, confidence]]
+        range: `Sheet1!${colLetter(cdnCol)}${entry.row}:${colLetter(urlCol)}${entry.row}`,
+        values: [[cdnFromUrl, server, damFromUrl, confidence, matchedUrl]]
       });
     }
   );
 
+  // Write headers first
   if(oauthToken){
     try{
-      setStatus('Writing results to Google Sheet…','running');
-      log('Writing headers…','info');
       await writeToSheet(sheetId,[{range:'Sheet1!A1',values:[newHeader]}]);
-      await writeToSheet(sheetId,sheetUpdates);
+    }catch(err){ log('Header write failed: '+err.message,'err'); }
+  }
+
+  // Write all collected results to sheet
+  if(oauthToken && sheetUpdates.length > 0){
+    try{
+      setStatus('Writing results to Google Sheet…','running');
+      // Write in chunks of 50 to avoid payload limits
+      for(let i=0;i<sheetUpdates.length;i+=50){
+        await writeToSheet(sheetId, sheetUpdates.slice(i, i+50));
+      }
       log(`Done — ${sheetUpdates.length} rows written back to sheet.`,'ok');
       stopTimer();
-      setStatus(`Complete — ${entries.length} sites scanned, sheet updated ✓`,'ok',`${entries.length} / ${entries.length}`);
+      setStatus(`Complete — ${results.filter(Boolean).length} sites scanned, sheet updated ✓`,'ok',`${results.filter(Boolean).length} / ${entries.length}`);
     }catch(err){
       log('Sheet write failed: '+err.message,'err');
       stopTimer();
@@ -523,14 +589,14 @@ async function run(){
     }
   }else{
     stopTimer();
-    setStatus(`Complete — ${entries.length} sites scanned. Use CSV export.`,'ok');
+    setStatus(`Complete — ${results.filter(Boolean).length} sites scanned. Use CSV export.`,'ok');
   }
   running=false;document.getElementById('runBtn').disabled=false;
 }
 
 function exportCSV(){
-  const rows=[['Company','Website','Imgix/Cloudinary','Confidence Score','Detail']];
-  results.forEach(r=>{if(r)rows.push([r.company,r.website,r.cdn,r.confidence,r.detail]);});
+  const rows=[['Company','Website','Identification from URL','Server','DAM','Confidence Score','URL']];
+  results.forEach(r=>{if(r)rows.push([r.company,r.website,r.cdnFromUrl,r.server,r.damFromUrl,r.confidence,r.matchedUrl]);});
   const csv=rows.map(r=>r.map(c=>`"${String(c||'').replace(/"/g,'""')}"`).join(',')).join('\n');
   const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download='cdn-results.csv';a.click();
 }
