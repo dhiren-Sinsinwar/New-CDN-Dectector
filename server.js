@@ -520,6 +520,36 @@ app.options('/crawl-stream', (req, res) => {
   res.sendStatus(204);
 });
 
+// ── Single company crawl endpoint — used by frontend polling loop ─────────────
+// Each request is short-lived (~5-15s), no streaming, no timeout issues
+app.post('/crawl', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process','--disable-blink-features=AutomationControlled'],
+  });
+
+  try {
+    const result = await crawlSite(browser, url);
+    res.json(result);
+  } catch (err) {
+    res.json({ cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message });
+  } finally {
+    await browser.close().catch(() => {});
+  }
+});
+
+app.options('/crawl', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.sendStatus(204);
+});
+
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
