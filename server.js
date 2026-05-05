@@ -1,5 +1,6 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteerCore = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 const path = require('path');
 
 const app = express();
@@ -48,42 +49,38 @@ function normaliseUrl(raw) {
   try { new URL(raw); return raw; } catch { return null; }
 }
 
-// Exact image content types shown in DevTools Network → Img tab
 const IMAGE_CONTENT_TYPES = [
   'image/jpeg', 'image/jpg', 'image/png', 'image/gif',
   'image/webp', 'image/avif', 'image/svg+xml', 'image/bmp',
   'image/tiff', 'image/ico', 'image/x-icon',
 ];
 
-function isImageContentType(contentType = '') {
-  return IMAGE_CONTENT_TYPES.some(t => contentType.toLowerCase().includes(t));
+function isImageContentType(ct = '') {
+  return IMAGE_CONTENT_TYPES.some(t => ct.toLowerCase().includes(t));
 }
 
 // ── Main crawl ────────────────────────────────────────────────────────────────
 async function crawl(rawUrl) {
   const url = normaliseUrl(rawUrl);
-  if (!url) return { cdn: 'Not available', confidence: 'Low', detail: 'Invalid URL', imageRequests: [] };
+  if (!url) return { cdn: 'Not available', confidence: 'Low', detail: 'Invalid URL', matchedUrl: null };
 
   let browser;
-  const imageRequests = []; // every image request — like DevTools Network → Img tab
+
+  // ── Shared result — written as soon as first CDN image is found ──
+  let foundResult = null;  // set this to stop scanning immediately
+  let imageCount  = 0;     // total image requests seen
 
   try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-blink-features=AutomationControlled',
-      ],
+    browser = await puppeteerCore.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
     });
 
     const page = await browser.newPage();
 
-    // Spoof as real Chrome browser
+    // Spoof as real Chrome
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     );
@@ -91,152 +88,130 @@ async function crawl(rawUrl) {
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     });
-
-    // Hide automation flags
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
       Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
       window.chrome = { runtime: {} };
     });
 
-    // ── Intercept all network requests ────────────────────────────────────────
     await page.setRequestInterception(true);
 
+    // ── Request handler ───────────────────────────────────────────────────────
     page.on('request', (req) => {
-      req.continue(); // let everything through — we only observe
+      // ── EARLY EXIT: if we already found a CDN, abort remaining image requests
+      // This is the key optimisation — stop loading images once CDN is identified
+      if (foundResult && req.resourceType() === 'image') {
+        req.abort();
+        return;
+      }
+      req.continue();
     });
 
-    // ── Listen to responses — this is the "Img" tab in DevTools Network ───────
-    // Every image the browser loads fires this event with full headers
+    // ── Response handler — DevTools "Img" tab equivalent ─────────────────────
     page.on('response', async (response) => {
+      // Already found — skip processing
+      if (foundResult) return;
+
       try {
-        const resUrl     = response.url();
-        const status     = response.status();
-        const headers    = response.headers();
+        const resUrl      = response.url();
+        const status      = response.status();
+        const headers     = response.headers();
         const contentType = headers['content-type'] || '';
         const resourceType = response.request().resourceType();
 
-        // Only process actual image responses — exactly like DevTools Img filter
+        // Only look at image responses — exactly like DevTools Network → Img filter
         const isImg = resourceType === 'image' || isImageContentType(contentType);
-        if (!isImg) return;
-        if (status < 200 || status >= 400) return;
+        if (!isImg || status < 200 || status >= 400) return;
 
-        // Check the image URL for CDN patterns
-        const cdnFromUrl    = detectInUrl(resUrl);
-        // Check the response headers for CDN patterns
+        imageCount++;
+
+        // ── Check URL first (fastest) ──
+        const cdnFromUrl = detectInUrl(resUrl);
+
+        // ── Check response headers ──
         const cdnFromHeader = detectInHeaders(headers);
-        const cdn           = cdnFromHeader || cdnFromUrl; // header match wins
 
-        imageRequests.push({
-          url:         resUrl,
-          contentType,
-          status,
-          headers: {
-            server:         headers['server']        || null,
-            'x-served-by':  headers['x-served-by']  || null,
-            via:            headers['via']           || null,
-            'x-cache':      headers['x-cache']       || null,
-            'content-type': contentType,
-          },
-          cdnDetected: cdn,
-          detectedVia: cdnFromHeader ? 'header' : cdnFromUrl ? 'url' : null,
-        });
+        const cdn = cdnFromHeader || cdnFromUrl;
 
-      } catch { /* ignore parse errors */ }
+        if (cdn) {
+          // ✅ Found it — record result and stop scanning
+          const detectedVia = cdnFromHeader ? 'response header' : 'image URL';
+          foundResult = {
+            cdn:        cdn === 'imgix' ? 'Imgix' : 'Cloudinary',
+            confidence: cdnFromHeader ? 'High' : 'High', // first confirmed signal = High
+            detail:     `Found on image #${imageCount} via ${detectedVia}: ${resUrl.slice(0, 80)}`,
+            matchedUrl: resUrl,
+          };
+
+          console.log(`[CDN] ✅ Found ${foundResult.cdn} on image #${imageCount} — stopping scan`);
+
+          // Stop the page navigation — no need to load more
+          page.evaluate(() => window.stop()).catch(() => {});
+        }
+
+      } catch { /* ignore */ }
     });
 
-    // ── Open the website ──────────────────────────────────────────────────────
+    // ── Navigate ──────────────────────────────────────────────────────────────
     try {
-      // networkidle2 = wait until no more than 2 network connections for 500ms
-      // This ensures all images have fully loaded — same as watching Network tab go quiet
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
     } catch {
-      try {
-        await page.goto(url, { waitUntil: 'load', timeout: 20000 });
-        await new Promise(r => setTimeout(r, 3000));
-      } catch {
+      // If we already found the CDN during navigation, that's fine
+      if (!foundResult) {
         try {
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-          await new Promise(r => setTimeout(r, 4000));
-        } catch (e) {
-          await browser.close().catch(() => {});
-          return { cdn: 'Not available', confidence: 'Low', detail: `Could not open: ${e.message}`, imageRequests: [] };
+          await page.goto(url, { waitUntil: 'load', timeout: 20000 });
+          await new Promise(r => setTimeout(r, 2000));
+        } catch {
+          try {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            await new Promise(r => setTimeout(r, 3000));
+          } catch (e) {
+            await browser.close().catch(() => {});
+            return { cdn: 'Not available', confidence: 'Low', detail: `Could not open: ${e.message}`, matchedUrl: null };
+          }
         }
       }
     }
 
-    // ── Scroll to trigger lazy-loaded images ──────────────────────────────────
-    // Sites like Shopify, Next.js load images as you scroll — this triggers them
-    await page.evaluate(async () => {
-      await new Promise(resolve => {
-        let total = 0;
-        const timer = setInterval(() => {
-          window.scrollBy(0, 300);
-          total += 300;
-          if (total >= Math.min(document.body.scrollHeight, 4000)) {
-            clearInterval(timer);
-            resolve();
-          }
-        }, 100);
-      });
-    });
-
-    // Wait for lazy images to load after scroll
-    await new Promise(r => setTimeout(r, 2500));
+    // ── If not found yet, scroll to trigger lazy images ───────────────────────
+    // Only scroll if we haven't found CDN yet
+    if (!foundResult) {
+      try {
+        await page.evaluate(async () => {
+          await new Promise(resolve => {
+            let total = 0;
+            const timer = setInterval(() => {
+              window.scrollBy(0, 300);
+              total += 300;
+              if (total >= Math.min(document.body.scrollHeight, 4000)) {
+                clearInterval(timer);
+                resolve();
+              }
+            }, 100);
+          });
+        });
+        // Wait briefly for lazy images to fire
+        await new Promise(r => setTimeout(r, 2000));
+      } catch { /* page may have been stopped */ }
+    }
 
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
-    return { cdn: 'Not available', confidence: 'Low', detail: `Browser error: ${err.message}`, imageRequests: [] };
+    return { cdn: 'Not available', confidence: 'Low', detail: `Browser error: ${err.message}`, matchedUrl: null };
   }
 
   await browser.close().catch(() => {});
 
-  // ── Score all captured image requests ─────────────────────────────────────
-  const totalImages   = imageRequests.length;
-  const imgixReqs     = imageRequests.filter(r => r.cdnDetected === 'imgix');
-  const cloudReqs     = imageRequests.filter(r => r.cdnDetected === 'cloudinary');
-  const imgixCount    = imgixReqs.length;
-  const cloudCount    = cloudReqs.length;
-
-  // Weight header detections 3x more than URL pattern matches
-  const imgixScore = imgixReqs.reduce((s, r) => s + (r.detectedVia === 'header' ? 3 : 1), 0);
-  const cloudScore = cloudReqs.reduce((s, r) => s + (r.detectedVia === 'header' ? 3 : 1), 0);
-  const total      = imgixScore + cloudScore;
-
-  if (total === 0) {
-    return {
-      cdn: 'Not available',
-      confidence: 'Low',
-      detail: `${totalImages} image requests captured — no Imgix or Cloudinary found`,
-      imageRequests: imageRequests.slice(0, 10),
-    };
+  // ── Return result ─────────────────────────────────────────────────────────
+  if (foundResult) {
+    return foundResult;
   }
-
-  let cdn, confidence;
-
-  if (imgixScore > 0 && cloudScore > 0) {
-    cdn        = 'Imgix, Cloudinary';
-    confidence = 'Medium';
-  } else if (imgixScore >= cloudScore) {
-    cdn        = 'Imgix';
-    confidence = imgixReqs.some(r => r.detectedVia === 'header') ? 'High'
-               : imgixCount >= 3 ? 'High'
-               : imgixCount >= 2 ? 'Medium' : 'Low';
-  } else {
-    cdn        = 'Cloudinary';
-    confidence = cloudReqs.some(r => r.detectedVia === 'header') ? 'High'
-               : cloudCount >= 3 ? 'High'
-               : cloudCount >= 2 ? 'Medium' : 'Low';
-  }
-
-  const sample = [...imgixReqs, ...cloudReqs][0];
-  const detail = `${totalImages} images captured — Imgix: ${imgixCount}, Cloudinary: ${cloudCount}${sample ? ' | ' + sample.url.slice(0, 70) + '…' : ''}`;
 
   return {
-    cdn,
-    confidence,
-    detail,
-    imageRequests: imageRequests.slice(0, 15),
+    cdn:        'Not available',
+    confidence: 'Low',
+    detail:     `${imageCount} image requests scanned — no Imgix or Cloudinary signals found`,
+    matchedUrl: null,
   };
 }
 
@@ -259,12 +234,12 @@ app.post('/crawl', async (req, res) => {
     console.log(`[CDN] ${url} → ${result.cdn} (${result.confidence}) | ${result.detail}`);
     res.json(result);
   } catch (err) {
-    console.error(`[CDN] Error for ${url}:`, err.message);
-    res.json({ cdn: 'Not available', confidence: 'Low', detail: err.message, imageRequests: [] });
+    console.error(`[CDN] Error:`, err.message);
+    res.json({ cdn: 'Not available', confidence: 'Low', detail: err.message, matchedUrl: null });
   }
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`CDN Detector (Puppeteer headless) on port ${PORT}`));
+app.listen(PORT, () => console.log(`CDN Detector running on port ${PORT}`));
