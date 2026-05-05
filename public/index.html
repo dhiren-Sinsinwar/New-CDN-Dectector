@@ -357,102 +357,57 @@ async function writeToSheet(sheetId,updates){
   if(!r.ok){const e=await r.json();throw new Error(e.error?.message||'Write failed');}
 }
 
-// ── Crawl via parallel SSE stream — batched with auto-resume ────────────────
-const BATCH_SIZE = 20;  // 20 companies per batch (~2-3 min each, well under Railway timeout)
-const MAX_RETRIES = 3;
+// ── Per-company polling — one short request per company, no long connections ──
+// Each /crawl request takes ~5-15s. Frontend loops through all companies itself.
+// No SSE, no batches, no Railway timeout issues. Works for any number of companies.
+const CONCURRENCY = 4; // 4 parallel crawls at a time
 
-async function crawlAllStream(serverUrl, allEntries, onProgress, onResult) {
+async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
   const base = serverUrl.replace(/\/$/, '');
-  
-  // Track which global indices are done so retries skip them
-  const completedIndices = new Set();
+  const queue = [...allEntries];
+  let done = 0;
 
-  // Split into batches — each entry keeps its GLOBAL index
-  const batches = [];
-  for (let i = 0; i < allEntries.length; i += BATCH_SIZE) {
-    batches.push(allEntries.slice(i, i + BATCH_SIZE));
-  }
+  // Run CONCURRENCY workers in parallel, each pulling from the queue
+  async function worker() {
+    while (queue.length > 0) {
+      const entry = queue.shift();
+      if (!entry) return;
 
-  log(`Starting ${allEntries.length} companies in ${batches.length} batches of ${BATCH_SIZE}`, 'info');
+      onProgress({ index: entry.index, company: entry.company, website: entry.url });
 
-  for (let b = 0; b < batches.length; b++) {
-    let batch = batches[b];
-    let retries = 0;
-
-    setStatus(`Batch ${b+1} of ${batches.length}…`, 'running', `${completedIndices.size} / ${allEntries.length}`);
-
-    while (retries <= MAX_RETRIES) {
-      // On retry, only send entries not yet completed
-      const toSend = retries === 0
-        ? batch
-        : batch.filter(e => !completedIndices.has(e.index));
-
-      if (toSend.length === 0) break; // all done in this batch
-
-      try {
-        const r = await fetch(base + '/crawl-stream', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ entries: toSend }),
-          signal: AbortSignal.timeout(300000) // 5 min per batch request
-        });
-
-        if (!r.ok) throw new Error(`Server ${r.status}`);
-
-        const reader = r.body.getReader();
-        const dec = new TextDecoder();
-        let buf = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split('\n');
-          buf = lines.pop();
-          for (const line of lines) {
-            if (!line.startsWith('data:')) continue;
-            try {
-              const ev = JSON.parse(line.slice(5).trim());
-              if (ev.type === 'progress') {
-                onProgress(ev);
-              } else if (ev.type === 'result') {
-                completedIndices.add(ev.index);
-                onResult({ ...ev, done: completedIndices.size, total: allEntries.length });
-              }
-            } catch { /* ignore parse errors */ }
+      let result;
+      let retries = 0;
+      while (retries <= 2) {
+        try {
+          const r = await fetch(base + '/crawl', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: entry.url }),
+            signal: AbortSignal.timeout(45000) // 45s per company max
+          });
+          if (!r.ok) throw new Error(`Server ${r.status}`);
+          result = await r.json();
+          break;
+        } catch (err) {
+          retries++;
+          if (retries > 2) {
+            result = { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: 'Failed: ' + err.message };
+          } else {
+            await new Promise(r => setTimeout(r, 2000 * retries));
           }
         }
-        break; // batch completed successfully
-
-      } catch (err) {
-        retries++;
-        const remaining = batch.filter(e => !completedIndices.has(e.index)).length;
-        
-        if (retries > MAX_RETRIES) {
-          // Give up on remaining entries in this batch
-          batch.filter(e => !completedIndices.has(e.index)).forEach(e => {
-            completedIndices.add(e.index);
-            onResult({ index: e.index, company: e.company, website: e.url, cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: 'Failed after retries', done: completedIndices.size, total: allEntries.length });
-          });
-          log(`Batch ${b+1} failed after ${MAX_RETRIES} retries — skipping ${remaining} companies`, 'err');
-          break;
-        }
-
-        const wait = retries * 4; // 4s, 8s, 12s
-        setStatus(`Batch ${b+1} dropped — retrying ${remaining} companies in ${wait}s (attempt ${retries}/${MAX_RETRIES})`, 'running');
-        log(`Connection dropped on batch ${b+1}, ${remaining} remaining — retry ${retries} in ${wait}s`, 'err');
-        await new Promise(r => setTimeout(r, wait * 1000));
       }
-    }
 
-    // Small gap between batches to let Railway breathe
-    if (b < batches.length - 1) {
-      await new Promise(r => setTimeout(r, 1500));
+      done++;
+      onResult({ index: entry.index, company: entry.company, website: entry.url, ...result, done, total: allEntries.length });
     }
   }
+
+  // Launch CONCURRENCY workers simultaneously
+  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 }
 
-// ── Table ─────────────────────────────────────────────────────────────────────
+// ── Table ─// ── Table ─────────────────────────────────────────────────────────────────────
 function cdnBadge(cdn){
   if(!cdn||cdn==='…')return '<span class="badge b-pending">—</span>';
   const l=cdn.toLowerCase();
@@ -562,8 +517,17 @@ async function run(){
   if(urlCol===-1)   {urlCol=newHeader.length;     newHeader.push('URL');}
 
   const sheetUpdates=[];
-  // Stream results in parallel — 4 sites crawled simultaneously
-  await crawlAllStream(
+
+  // ── Write headers FIRST before any scanning begins ───────────────────────
+  if(oauthToken){
+    try{
+      await writeToSheet(sheetId,[{range:'Sheet1!A1',values:[newHeader]}]);
+      log('✓ Sheet headers written: '+newHeader.join(', '),'ok');
+    }catch(err){ log('Header write failed: '+err.message,'err'); }
+  }
+
+  // Crawl all companies — parallel per-company requests, no long connections
+  await crawlAll(
     serverUrl,
     entries.map((e, i) => ({ company: e.company, url: e.website, index: i })),
     // onProgress
@@ -597,14 +561,6 @@ async function run(){
       }
     }
   );
-
-  // Write headers to sheet BEFORE scanning starts
-  if(oauthToken){
-    try{
-      await writeToSheet(sheetId,[{range:'Sheet1!A1',values:[newHeader]}]);
-      log('Sheet headers written — results will auto-save every 5 rows','ok');
-    }catch(err){ log('Header write failed: '+err.message,'err'); }
-  }
 
   // Final flush — write any remaining results not yet saved
   if(oauthToken && sheetUpdates.length > 0){
