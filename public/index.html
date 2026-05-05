@@ -101,6 +101,14 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
 .log-info{color:var(--blue);display:block}
 .source-tag{font-size:10px;padding:1px 6px;border-radius:4px;margin-left:6px;background:var(--bg3);color:var(--muted);border:.5px solid var(--border)}
 .source-tag.browser{background:#0a1a30;color:#93c5fd;border-color:#1a3a6a}
+.timer-bar{background:var(--bg2);border:.5px solid var(--border);border-radius:12px;padding:12px 18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px;font-size:12px;color:var(--muted2)}
+.timer-bar.running{border-color:#3a2e00}
+.timer-bar.done{border-color:#1a4a2e}
+.timer-item{display:flex;flex-direction:column;gap:2px}
+.timer-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
+.timer-value{font-family:'Syne',sans-serif;font-size:15px;font-weight:600;color:var(--text)}
+.timer-value.elapsed{color:var(--amber)}
+.timer-value.done{color:var(--green)}
 </style>
 </head>
 <body>
@@ -188,6 +196,21 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
     <span id="statusText">Ready — complete Steps 1 & 2 then paste your sheet URL</span>
     <span class="status-count" id="statusCount"></span>
   </div>
+  <div class="timer-bar" id="timerBar" style="display:none">
+    <div class="timer-item">
+      <span class="timer-label">Started</span>
+      <span class="timer-value" id="timerStart">—</span>
+    </div>
+    <div class="timer-item" style="text-align:center">
+      <span class="timer-label">Elapsed</span>
+      <span class="timer-value elapsed" id="timerElapsed">0s</span>
+    </div>
+    <div class="timer-item" style="text-align:right">
+      <span class="timer-label">Finished</span>
+      <span class="timer-value" id="timerEnd">—</span>
+    </div>
+  </div>
+
   <div class="progress-wrap" id="progressWrap" style="display:none">
     <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
     <div class="progress-meta"><span id="progressLabel">Starting…</span><span id="progressPct">0%</span></div>
@@ -216,6 +239,7 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 let results=[], running=false, oauthToken=null, tokenClient=null, clientIdReady=false;
+let timerStart=null, timerInterval=null;
 
 window.addEventListener('load', () => {
   const saved=localStorage.getItem('gClientId')||'';
@@ -246,6 +270,39 @@ function log(msg,type){
   line.textContent='› '+msg;
   box.appendChild(line);
   box.scrollTop=box.scrollHeight;
+}
+function formatTime(date){
+  return date.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function formatDuration(ms){
+  const s=Math.floor(ms/1000);
+  const m=Math.floor(s/60);
+  const h=Math.floor(m/60);
+  if(h>0) return `${h}h ${m%60}m ${s%60}s`;
+  if(m>0) return `${m}m ${s%60}s`;
+  return `${s}s`;
+}
+function startTimer(){
+  timerStart=new Date();
+  document.getElementById('timerBar').style.display='flex';
+  document.getElementById('timerBar').className='timer-bar running';
+  document.getElementById('timerStart').textContent=formatTime(timerStart);
+  document.getElementById('timerEnd').textContent='—';
+  document.getElementById('timerElapsed').className='timer-value elapsed';
+  if(timerInterval) clearInterval(timerInterval);
+  timerInterval=setInterval(()=>{
+    const elapsed=Date.now()-timerStart.getTime();
+    document.getElementById('timerElapsed').textContent=formatDuration(elapsed);
+  },1000);
+}
+function stopTimer(){
+  if(timerInterval){clearInterval(timerInterval);timerInterval=null;}
+  const end=new Date();
+  const elapsed=end.getTime()-timerStart.getTime();
+  document.getElementById('timerEnd').textContent=formatTime(end);
+  document.getElementById('timerElapsed').textContent=formatDuration(elapsed);
+  document.getElementById('timerElapsed').className='timer-value done';
+  document.getElementById('timerBar').className='timer-bar done';
 }
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function colLetter(n){let s='';n++;while(n>0){s=String.fromCharCode(65+(n-1)%26)+s;n=Math.floor((n-1)/26);}return s;}
@@ -367,6 +424,7 @@ async function run(){
 
   localStorage.setItem('serverUrl',serverUrl);
   running=true;results=[];
+  startTimer();
   document.getElementById('runBtn').disabled=true;
   document.getElementById('tableBody').innerHTML='';
   document.getElementById('logBox').innerHTML='';
@@ -438,12 +496,15 @@ async function run(){
       await writeToSheet(sheetId,[{range:'Sheet1!A1',values:[newHeader]}]);
       await writeToSheet(sheetId,sheetUpdates);
       log(`Done — ${sheetUpdates.length} rows written back to sheet.`,'ok');
+      stopTimer();
       setStatus(`Complete — ${entries.length} sites scanned, sheet updated ✓`,'ok',`${entries.length} / ${entries.length}`);
     }catch(err){
       log('Sheet write failed: '+err.message,'err');
+      stopTimer();
       setStatus('Done but sheet write failed — use CSV export','error');
     }
   }else{
+    stopTimer();
     setStatus(`Complete — ${entries.length} sites scanned. Use CSV export.`,'ok');
   }
   running=false;document.getElementById('runBtn').disabled=false;
