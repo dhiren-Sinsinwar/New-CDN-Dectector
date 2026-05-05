@@ -356,16 +356,35 @@ async function writeToSheet(sheetId,updates){
   if(!r.ok){const e=await r.json();throw new Error(e.error?.message||'Write failed');}
 }
 
-// ── Crawl via Puppeteer server ────────────────────────────────────────────────
-async function crawlWebsite(serverUrl, website){
-  const r=await fetch(serverUrl.replace(/\/$/, '')+'/crawl',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url:website}),
-    signal: AbortSignal.timeout(45000) // 45s timeout per site
+// ── Crawl via parallel SSE stream ────────────────────────────────────────────
+async function crawlAllStream(serverUrl, entries, onProgress, onResult) {
+  const r = await fetch(serverUrl.replace(/\/$/, '') + '/crawl-stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entries }),
+    signal: AbortSignal.timeout(600000) // 10 min total
   });
-  if(!r.ok)throw new Error(`Server error: ${r.status}`);
-  return await r.json();
+  if (!r.ok) throw new Error(`Server error: ${r.status}`);
+
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      try {
+        const ev = JSON.parse(line.slice(5).trim());
+        if (ev.type === 'progress') onProgress(ev);
+        if (ev.type === 'result')   onResult(ev);
+      } catch { /* ignore */ }
+    }
+  }
 }
 
 // ── Table ─────────────────────────────────────────────────────────────────────
@@ -460,34 +479,33 @@ async function run(){
   if(confCol===-1){confCol=newHeader.length;newHeader.push('Confidence Score');}
 
   const sheetUpdates=[];
-  for(let i=0;i<entries.length;i++){
-    const{row,company,website}=entries[i];
-    setStatus(`Scanning ${company}…`,'running',`${i+1} / ${entries.length}`);
-    setProgress(i,entries.length,`Opening ${company} in headless browser…`);
-    log(`Scanning ${company} — ${website}`,'info');
-    updateRow(i,company,website,'…','—','Opening in browser…');
-
-    let cdn='Not available',confidence='Low',detail='';
-    try{
-      const r=await crawlWebsite(serverUrl,website);
-      cdn=r.cdn||'Not available';
-      confidence=r.confidence||'Low';
-      detail=r.detail||'';
-      log(`${company}: ${cdn} (${confidence}) — ${detail}`,'ok');
-    }catch(err){
-      detail='Error: '+err.message;
-      log(`${company}: ${err.message}`,'err');
+  // Stream results in parallel — 4 sites crawled simultaneously
+  await crawlAllStream(
+    serverUrl,
+    entries.map(e => ({ company: e.company, url: e.website })),
+    // onProgress
+    (ev) => {
+      setStatus(`Scanning ${ev.company}…`, 'running', `${ev.done||0} / ${entries.length}`);
+      updateRow(ev.index, ev.company, entries[ev.index].website, '…', '—', 'Scanning…');
+    },
+    // onResult
+    (ev) => {
+      const cdn        = ev.cdn        || 'Not available';
+      const confidence = ev.confidence || 'Low';
+      const detail     = ev.detail     || '';
+      results[ev.index] = { company: ev.company, website: entries[ev.index].website, cdn, confidence, detail };
+      updateRow(ev.index, ev.company, entries[ev.index].website, cdn, confidence, detail);
+      updateSummary();
+      setProgress(ev.done, ev.total, `Done: ${ev.company}`);
+      setStatus(`Scanning… (${ev.done}/${ev.total})`, 'running', `${ev.done} / ${ev.total}`);
+      log(`${ev.company}: ${cdn} (${confidence}) — ${detail}`, cdn === 'Not available' ? 'err' : 'ok');
+      const entry = entries[ev.index];
+      sheetUpdates.push({
+        range: `Sheet1!${colLetter(cdnCol)}${entry.row}:${colLetter(confCol)}${entry.row}`,
+        values: [[cdn, confidence]]
+      });
     }
-
-    results[i]={company,website,cdn,confidence,detail};
-    updateRow(i,company,website,cdn,confidence,detail);
-    updateSummary();
-    setProgress(i+1,entries.length,`Done: ${company}`);
-    sheetUpdates.push({
-      range:`Sheet1!${colLetter(cdnCol)}${row}:${colLetter(confCol)}${row}`,
-      values:[[cdn,confidence]]
-    });
-  }
+  );
 
   if(oauthToken){
     try{
