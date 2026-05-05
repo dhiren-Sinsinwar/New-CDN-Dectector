@@ -257,6 +257,39 @@ const IMAGE_TYPES = [
 ];
 function isImgCT(ct = '') { return IMAGE_TYPES.some(t => ct.toLowerCase().includes(t)); }
 
+// ── URLs to NEVER save as matched URL ───────────────────────────────────────
+const EXCLUDED_URL_PATTERNS = [
+  /challenges\.cloudflare\.com/i,
+  /cdn-cgi\/challenge/i,
+  /cdn-cgi\//i,
+  /pixel\.wp\.com\/g\.gif/i,
+  /\.wp\.com\/g\.gif/i,
+  /google-analytics\.com/i,
+  /googletagmanager\.com/i,
+  /\/beacon\./i,
+  /g\.gif\?/i,
+  /spacer\.gif/i,
+  /blank\.gif/i,
+  /pixel\.gif/i,
+  /1x1\.gif/i,
+  /\/favicon\.ico/i,
+  /cdnjs\.cloudflare\.com/i,
+];
+function isExcludedUrl(url) { return EXCLUDED_URL_PATTERNS.some(p => p.test(url)); }
+
+// ── CDN priority — specific image CDNs beat generic infrastructure ───────────
+const CDN_PRIORITY = {
+  'Imgix':10,'Cloudinary':10,'ImageKit':10,'Gumlet':10,'Scene7':10,
+  'Cloudimage':10,'ImageEngine':10,'Sirv':10,'Twicpics':10,'Uploadcare':10,
+  'Storyblok':9,'Contentful':9,'Sanity CDN':9,'Prismic CDN':9,
+  'Shopify CDN':8,'WordPress CDN':7,'Jetpack CDN':7,'Wix CDN':7,'Squarespace CDN':7,
+  'Firebase Storage':6,'Google Cloud Storage':6,'AWS S3':6,'Azure Blob':6,
+  'Bunny CDN':5,'KeyCDN':5,'CloudFront':4,'Akamai':4,'Fastly':4,
+  'Azure CDN':4,'Azure Front Door':4,
+  'Cloudflare':2,'Nginx':1,'Apache':1,'LiteSpeed':1,'Varnish CDN':1,
+};
+function getCDNPriority(name) { return CDN_PRIORITY[name] || 3; }
+
 // ── Cookie / modal bypass texts (from analyzer.py) ───────────────────────────
 const COOKIE_TEXTS = [
   'accept all','accept','allow all','allow cookies','accept cookies',
@@ -283,6 +316,7 @@ async function crawlSite(browser, rawUrl) {
   let serverCDN    = null;  // CDN identified from server header
   let damFromUrl   = null;  // DAM identified from any URL
   let matchedUrl   = null;  // the exact image URL that triggered CDN detection
+  let bestImageUrl = null;  // best real image URL seen (fallback when matchedUrl is empty)
   let page;
 
   try {
@@ -350,6 +384,17 @@ async function crawlSite(browser, rawUrl) {
           return;
         }
 
+        // ── Track the best real image URL seen so far (fallback for matchedUrl) ─
+        // Prefer larger images — skip tiny icons/SVG logos/trackers
+        if (!isExcludedUrl(resUrl) && resUrl.startsWith('http')) {
+          // Prefer URLs that look like real content images over logos/icons
+          const isLikelyContent = /\.(jpg|jpeg|png|webp|gif|avif)/i.test(resUrl) &&
+            !/favicon|icon|logo|pixel|spacer|blank|1x1|sprite/i.test(resUrl);
+          if (!bestImageUrl || isLikelyContent) {
+            bestImageUrl = resUrl;
+          }
+        }
+
         // ── Extract server header from this image response ────────────────────
         const rawServer = extractServerHeader(headers);
         if (rawServer && !serverHeader) serverHeader = rawServer;
@@ -360,19 +405,32 @@ async function crawlSite(browser, rawUrl) {
 
         // ── Check image URL for CDN ───────────────────────────────────────────
         const urlCDN = detectCDNFromUrl(resUrl);
-        if (urlCDN && !cdnFromUrl) {
-          cdnFromUrl = urlCDN;
-          matchedUrl = resUrl;
+        if (urlCDN) {
+          const newPriority = getCDNPriority(urlCDN);
+          const curPriority = cdnFromUrl ? getCDNPriority(cdnFromUrl) : -1;
+
+          // Use this CDN if it has higher priority than what we found before
+          // AND the URL is not a bot-protection/tracking URL
+          if (newPriority > curPriority) {
+            cdnFromUrl = urlCDN;
+            // Only save matchedUrl if it's a real content URL (not challenge/tracker)
+            if (!isExcludedUrl(resUrl)) {
+              matchedUrl = resUrl;
+            }
+          } else if (newPriority === curPriority && !matchedUrl && !isExcludedUrl(resUrl)) {
+            // Same priority but no URL saved yet — save this one
+            matchedUrl = resUrl;
+          }
         }
 
         // ── Also check image URL for DAM ──────────────────────────────────────
         const imgDam = detectDAMFromUrl(resUrl);
         if (imgDam && !damFromUrl) damFromUrl = imgDam;
 
-        // ── Early stop: if we have CDN from URL AND server header, we're done ─
-        if (cdnFromUrl && serverHeader) {
+        // ── Early stop: high-priority CDN confirmed with a real URL ───────────
+        if (cdnFromUrl && matchedUrl && getCDNPriority(cdnFromUrl) >= 8) {
           done = true;
-          console.log(`[CDN] ✅ ${cdnFromUrl} (URL) + server="${serverHeader}" on image #${imageCount} — stopping`);
+          console.log(`[CDN] ✅ ${cdnFromUrl} (priority ${getCDNPriority(cdnFromUrl)}) on image #${imageCount} — stopping`);
           page.evaluate(() => window.stop()).catch(() => {});
         }
 
@@ -443,11 +501,15 @@ async function crawlSite(browser, rawUrl) {
   const finalDAM  = damFromUrl  || 'Not available';
   const detail    = `${imageCount} images scanned${cdnFromUrl ? ' | CDN URL: '+cdnFromUrl : ''}${serverHeader ? ' | Server: '+serverHeader : ''}${damFromUrl ? ' | DAM: '+damFromUrl : ''}`;
 
+  // Use matchedUrl if we have one; otherwise fall back to the best real image URL
+  // This fills in URLs for sites where CDN was detected from server headers only
+  const finalUrl = matchedUrl || bestImageUrl || '';
+
   return {
     cdnFromUrl:  finalCDN,
     server:      serverHeader || serverCDN || '',
     damFromUrl:  finalDAM,
-    matchedUrl:  matchedUrl || '',
+    matchedUrl:  finalUrl,
     confidence,
     detail,
   };
