@@ -78,8 +78,8 @@ button.primary.signed{background:#1a7a3a}
 button.ghost{background:transparent;color:var(--accent);border:.5px solid var(--accent);border-radius:7px;padding:6px 14px;font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:background .15s}
 button.ghost:hover{background:rgba(212,245,122,.08)}
 .table-wrap{background:var(--bg2);border:.5px solid var(--border);border-radius:14px;overflow:hidden}
-.table-head{display:grid;grid-template-columns:1.4fr 1.4fr 1.2fr 1.2fr 1.2fr .8fr 1.8fr;font-size:10.5px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;padding:10px 16px;background:var(--bg3);border-bottom:.5px solid var(--border)}
-.table-row{display:grid;grid-template-columns:1.4fr 1.4fr 1.2fr 1.2fr 1.2fr .8fr 1.8fr;padding:11px 16px;border-bottom:.5px solid var(--border);align-items:center;font-size:13px;transition:background .1s;animation:rowIn .28s ease both}
+.table-head{display:grid;grid-template-columns:1fr 1fr 1fr .9fr .9fr .6fr 1.4fr 1.4fr 1.6fr;font-size:10.5px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;padding:10px 16px;background:var(--bg3);border-bottom:.5px solid var(--border)}
+.table-row{display:grid;grid-template-columns:1fr 1fr 1fr .9fr .9fr .6fr 1.4fr 1.4fr 1.6fr;padding:11px 16px;border-bottom:.5px solid var(--border);align-items:center;font-size:13px;transition:background .1s;animation:rowIn .28s ease both}
 .table-row:last-child{border-bottom:none}
 .table-row:hover{background:var(--bg3)}
 @keyframes rowIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
@@ -230,7 +230,7 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
       <button class="ghost" onclick="exportCSV()">Export CSV</button>
     </div>
     <div class="table-wrap">
-      <div class="table-head"><div>Company</div><div>Website</div><div>ID from URL</div><div>Server</div><div>DAM</div><div>Confidence</div><div>Matched URL</div></div>
+      <div class="table-head"><div>Company</div><div>Website</div><div>ID from URL</div><div>Server</div><div>DAM</div><div>Confidence</div><div>Matched URL</div><div>Error / Reason</div><div>Website Traffic</div></div>
       <div id="tableBody"></div>
     </div>
     <div class="log-box" id="logBox"></div>
@@ -429,8 +429,15 @@ function damBadge(d){
   if(!d||d==='Not available')return '<span class="badge b-na">—</span>';
   return `<span class="badge" style="background:#1a0a30;color:#c4b5fd;border:.5px solid #3a2a6a;font-size:10px">${esc(d)}</span>`;
 }
-function rowHtml(i,co,web,cdn,server,dam,conf,mUrl){
+function reasonBadge(cdn, reason){
+  if(!reason || cdn !== 'Not available') return '<span style="color:var(--muted);font-size:11px">—</span>';
+  return `<span style="font-size:10px;color:var(--red);line-height:1.4" title="${esc(reason)}">${esc(reason.slice(0,60))}${reason.length>60?'…':''}</span>`;
+}
+function rowHtml(i,co,web,cdn,server,dam,conf,mUrl,reason,traffic){
   const shortUrl = mUrl ? mUrl.slice(0,50)+(mUrl.length>50?'…':'') : '—';
+  const trafficHtml = traffic
+    ? `<span style="font-size:11px;color:var(--green)">${esc(traffic)}</span>`
+    : `<span style="color:var(--muted);font-size:11px">Fetching…</span>`;
   return `<div class="table-row" id="row-${i}" style="animation-delay:${Math.min(i*25,350)}ms">
     <div class="c-co" title="${esc(co)}">${esc(co)}</div>
     <div class="c-web" title="${esc(web)}">${esc(web)}</div>
@@ -439,11 +446,13 @@ function rowHtml(i,co,web,cdn,server,dam,conf,mUrl){
     <div>${damBadge(dam)}</div>
     <div>${confBadge(conf)}</div>
     <div class="c-detail" title="${esc(mUrl||'')}">${shortUrl}</div>
+    <div>${reasonBadge(cdn, reason)}</div>
+    <div>${trafficHtml}</div>
   </div>`;
 }
-function updateRow(i,co,web,cdn,server,dam,conf,mUrl){
+function updateRow(i,co,web,cdn,server,dam,conf,mUrl,reason,traffic){
   const el=document.getElementById('row-'+i);
-  const html=rowHtml(i,co,web,cdn,server,dam,conf,mUrl);
+  const html=rowHtml(i,co,web,cdn,server,dam,conf,mUrl,reason,traffic||'');
   if(el)el.outerHTML=html;else document.getElementById('tableBody').insertAdjacentHTML('beforeend',html);
 }
 function updateSummary(){
@@ -463,6 +472,35 @@ function updateSummary(){
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+// ── SimilarWeb traffic fetch ──────────────────────────────────────────────────
+// Uses SimilarWeb's public API (no key needed for basic stats)
+async function fetchTraffic(website) {
+  try {
+    const domain = new URL(website.startsWith('http') ? website : 'https://'+website).hostname.replace(/^www\./, '');
+    // SimilarWeb public data endpoint
+    const r = await fetch(`https://data.similarweb.com/api/v1/data?domain=${domain}`, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!r.ok) return { traffic: '', trafficRaw: null };
+    const d = await r.json();
+    const monthly = d?.Engagments?.Visits || d?.EstimatedMonthlyVisits || null;
+    const pagesPerVisit = d?.Engagments?.PagePerVisit || null;
+    if (!monthly || !pagesPerVisit) return { traffic: '', trafficRaw: null };
+    const totalPages = Math.round(monthly * pagesPerVisit);
+    // Format nicely: 1,234,567
+    const fmt = n => n >= 1e9 ? (n/1e9).toFixed(1)+'B' : n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(0)+'K' : String(n);
+    return {
+      traffic: `${fmt(Math.round(monthly))} visits × ${pagesPerVisit.toFixed(1)} pages = ${fmt(totalPages)} pages/mo`,
+      trafficRaw: totalPages,
+      monthlyVisits: Math.round(monthly),
+      pagesPerVisit: pagesPerVisit,
+    };
+  } catch {
+    return { traffic: '', trafficRaw: null };
+  }
+}
+
 async function run(){
   if(running)return;
   const serverUrl=document.getElementById('serverUrl').value.trim();
@@ -502,19 +540,23 @@ async function run(){
 
   const entries=rows.slice(1).filter(r=>r[websiteIdx]).map((r,i)=>({row:i+2,company:r[companyIdx]||'',website:r[websiteIdx]||''}));
   document.getElementById('sumTotal').textContent=entries.length;
-  entries.forEach((e,i)=>updateRow(i,e.company,e.website,'…','','','—',''));
+  entries.forEach((e,i)=>updateRow(i,e.company,e.website,'…','','','—','','',''));
 
   let cdnCol    = header.findIndex(h=>/identification.*url|imgix.?cloudinary|cdn/i.test(h));
   let serverCol = header.findIndex(h=>/^server$/i.test(h));
   let damCol    = header.findIndex(h=>/^dam$/i.test(h));
   let confCol   = header.findIndex(h=>/confidence/i.test(h));
   let urlCol    = header.findIndex(h=>/^url$/i.test(h));
+  let reasonCol = header.findIndex(h=>/error|reason/i.test(h));
   const newHeader=[...header];
   if(cdnCol===-1)   {cdnCol=newHeader.length;    newHeader.push('Identification from URL');}
   if(serverCol===-1){serverCol=newHeader.length;  newHeader.push('Server');}
   if(damCol===-1)   {damCol=newHeader.length;     newHeader.push('DAM');}
   if(confCol===-1)  {confCol=newHeader.length;    newHeader.push('Confidence Score');}
   if(urlCol===-1)   {urlCol=newHeader.length;     newHeader.push('URL');}
+  if(reasonCol===-1){reasonCol=newHeader.length;  newHeader.push('Error / Reason');}
+  let trafficCol = header.findIndex(h=>/traffic|pages.*visit|monthly.*visit/i.test(h));
+  if(trafficCol===-1){trafficCol=newHeader.length; newHeader.push('Website Traffic (Monthly Visits × Pages/Visit)');}
 
   const sheetUpdates=[];
 
@@ -533,7 +575,7 @@ async function run(){
     // onProgress
     (ev) => {
       setStatus(`Scanning ${ev.company}…`, 'running', `${ev.done||0} / ${entries.length}`);
-      updateRow(ev.index, ev.company, entries[ev.index].website, '…', '', '', '—', '');
+      updateRow(ev.index, ev.company, entries[ev.index].website, '…', '', '', '—', '', '', '');
     },
     // onResult
     (ev) => {
@@ -542,17 +584,35 @@ async function run(){
       const damFromUrl  = ev.damFromUrl  || 'Not available';
       const confidence  = ev.confidence  || 'Low';
       const matchedUrl  = ev.matchedUrl  || '';
-      results[ev.index] = { company: ev.company, website: entries[ev.index].website, cdnFromUrl, server, damFromUrl, confidence, matchedUrl };
-      updateRow(ev.index, ev.company, entries[ev.index].website, cdnFromUrl, server, damFromUrl, confidence, matchedUrl);
+      const reason      = ev.reason      || '';
+      results[ev.index] = { company: ev.company, website: entries[ev.index].website, cdnFromUrl, server, damFromUrl, confidence, matchedUrl, reason, traffic: '' };
+      updateRow(ev.index, ev.company, entries[ev.index].website, cdnFromUrl, server, damFromUrl, confidence, matchedUrl, reason);
       updateSummary();
       setProgress(ev.done, ev.total, `Done: ${ev.company}`);
       setStatus(`Scanning… (${ev.done}/${ev.total})`, 'running', `${ev.done} / ${ev.total}`);
       const found = cdnFromUrl!=='Not available'||server||damFromUrl!=='Not available';
       log(`${ev.company}: CDN=${cdnFromUrl} | Server=${server||'—'} | DAM=${damFromUrl}`, found?'ok':'err');
       const entry = entries[ev.index];
+
+      // Fetch traffic data async — don't block the crawl
+      fetchTraffic(entry.website).then(t => {
+        if (results[ev.index]) results[ev.index].traffic = t.traffic || '';
+        // Update sheet with traffic data
+        if (oauthToken && t.traffic) {
+          writeToSheet(sheetId, [{
+            range: `Sheet1!${colLetter(trafficCol)}${entry.row}`,
+            values: [[t.traffic]]
+          }]).catch(() => {});
+        }
+        // Update table row with traffic
+        const r = results[ev.index];
+        if (r) updateRow(ev.index, r.company, r.website, r.cdnFromUrl, r.server, r.damFromUrl, r.confidence, r.matchedUrl, r.reason, r.traffic);
+        log(`${ev.company} traffic: ${t.traffic || 'N/A'}`, 'info');
+      });
+
       sheetUpdates.push({
-        range: `Sheet1!${colLetter(cdnCol)}${entry.row}:${colLetter(urlCol)}${entry.row}`,
-        values: [[cdnFromUrl, server, damFromUrl, confidence, matchedUrl]]
+        range: `Sheet1!${colLetter(cdnCol)}${entry.row}:${colLetter(reasonCol)}${entry.row}`,
+        values: [[cdnFromUrl, server, damFromUrl, confidence, matchedUrl, reason]]
       });
       // Write to sheet immediately every 5 results — don't wait until end
       if(oauthToken && sheetUpdates.length % 5 === 0){
@@ -591,8 +651,8 @@ async function run(){
 }
 
 function exportCSV(){
-  const rows=[['Company','Website','Identification from URL','Server','DAM','Confidence Score','URL']];
-  results.forEach(r=>{if(r)rows.push([r.company,r.website,r.cdnFromUrl,r.server,r.damFromUrl,r.confidence,r.matchedUrl]);});
+  const rows=[['Company','Website','Identification from URL','Server','DAM','Confidence Score','URL','Error / Reason','Website Traffic']];
+  results.forEach(r=>{if(r)rows.push([r.company,r.website,r.cdnFromUrl,r.server,r.damFromUrl,r.confidence,r.matchedUrl,r.reason||'',r.traffic||'']);});
   const csv=rows.map(r=>r.map(c=>`"${String(c||'').replace(/"/g,'""')}"`).join(',')).join('\n');
   const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download='cdn-results.csv';a.click();
 }
