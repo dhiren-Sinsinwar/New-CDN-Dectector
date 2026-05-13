@@ -308,6 +308,7 @@ function stopTimer(){
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function colLetter(n){let s='';n++;while(n>0){s=String.fromCharCode(65+(n-1)%26)+s;n=Math.floor((n-1)/26);}return s;}
 function extractSheetId(url){const m=url.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);return m?m[1]:null;}
+function extractGid(url){const m=url.match(/gid=([0-9]+)/);return m?m[1]:null;}
 
 // ── OAuth ─────────────────────────────────────────────────────────────────────
 function applyClientId(){
@@ -341,9 +342,29 @@ function signInGoogle(){
 }
 
 // ── Sheets ────────────────────────────────────────────────────────────────────
-async function fetchSheetData(sheetId){
+let activeSheetName = 'Sheet1'; // updated dynamically from the actual sheet
+
+async function fetchSheetData(sheetId, gid){
   const hdrs=oauthToken?{'Authorization':'Bearer '+oauthToken}:{};
-  const r=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/A1:Z1000`,{headers:hdrs});
+
+  // Step 1: Get spreadsheet metadata to find the correct sheet name by gid
+  try {
+    const metaR = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`, {headers:hdrs});
+    if (metaR.ok) {
+      const meta = await metaR.json();
+      const sheets = meta.sheets || [];
+      let matched = null;
+      if (gid) {
+        matched = sheets.find(s => String(s.properties.sheetId) === String(gid));
+      }
+      // Fall back to first sheet if gid not found or not provided
+      activeSheetName = matched ? matched.properties.title : sheets[0]?.properties?.title || 'Sheet1';
+      log(`Using sheet tab: "${activeSheetName}"`, 'info');
+    }
+  } catch { /* use default Sheet1 */ }
+
+  // Step 2: Read data from the correct sheet
+  const r=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(activeSheetName)}!A1:Z1000`,{headers:hdrs});
   if(!r.ok){const e=await r.json();throw new Error(e.error?.message||'Failed to read sheet');}
   return(await r.json()).values||[];
 }
@@ -525,7 +546,8 @@ async function run(){
   let rows,header,companyIdx,websiteIdx;
   try{
     log('Fetching sheet data…','info');
-    rows=await fetchSheetData(sheetId);
+    const gid = extractGid(document.getElementById('sheetUrl').value.trim());
+    rows=await fetchSheetData(sheetId, gid);
     if(!rows||rows.length<2)throw new Error('Sheet is empty or has no data rows');
     header=rows[0].map(h=>String(h).trim());
     companyIdx=header.findIndex(h=>/company/i.test(h));
@@ -563,7 +585,7 @@ async function run(){
   // ── Write headers FIRST before any scanning begins ───────────────────────
   if(oauthToken){
     try{
-      await writeToSheet(sheetId,[{range:'Sheet1!A1',values:[newHeader]}]);
+      await writeToSheet(sheetId,[{range:`${activeSheetName}!A1`,values:[newHeader]}]);
       log('✓ Sheet headers written: '+newHeader.join(', '),'ok');
     }catch(err){ log('Header write failed: '+err.message,'err'); }
   }
@@ -600,7 +622,7 @@ async function run(){
         // Update sheet with traffic data
         if (oauthToken && t.traffic) {
           writeToSheet(sheetId, [{
-            range: `Sheet1!${colLetter(trafficCol)}${entry.row}`,
+            range: `${activeSheetName}!${colLetter(trafficCol)}${entry.row}`,
             values: [[t.traffic]]
           }]).catch(() => {});
         }
@@ -611,7 +633,7 @@ async function run(){
       });
 
       sheetUpdates.push({
-        range: `Sheet1!${colLetter(cdnCol)}${entry.row}:${colLetter(reasonCol)}${entry.row}`,
+        range: `${activeSheetName}!${colLetter(cdnCol)}${entry.row}:${colLetter(reasonCol)}${entry.row}`,
         values: [[cdnFromUrl, server, damFromUrl, confidence, matchedUrl, reason]]
       });
       // Write to sheet immediately every 5 results — don't wait until end
