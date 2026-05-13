@@ -337,7 +337,7 @@ function initTokenClient(clientId){
 }
 function signInGoogle(){
   if(!clientIdReady){toggleOAuthHelp();document.getElementById('oauthClientId').focus();setStatus('Paste your OAuth Client ID first','error');return;}
-  tokenClient.requestAccessToken({prompt:''});
+  tokenClient.requestAccessToken({prompt:'select_account'});
 }
 
 // ── Sheets ────────────────────────────────────────────────────────────────────
