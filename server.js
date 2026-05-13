@@ -323,6 +323,10 @@ async function crawlSite(browser, rawUrl) {
   try {
     page = await browser.newPage();
 
+    // Ignore SSL certificate errors (expired certs, self-signed, invalid dates)
+    await page.setBypassCSP(true);
+    await page._client().send('Security.setIgnoreCertificateErrors', { ignore: true }).catch(() => {});
+
     // Pick UA consistent per domain
     const domain = new URL(url).hostname;
     const UAS = [
@@ -337,18 +341,109 @@ async function crawlSite(browser, rawUrl) {
     const ua = UAS[Math.abs(hash) % UAS.length];
 
     await page.setUserAgent(ua);
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-      window.chrome = { runtime: {} };
+
+    // ── Full realistic browser headers ───────────────────────────────────────
+    // Bots get detected when headers don't match what a real Chrome sends
+    await page.setExtraHTTPHeaders({
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-CH-UA': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'Sec-CH-UA-Mobile': '?0',
+      'Sec-CH-UA-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
     });
+
+    // ── Deep navigator/window spoofing ────────────────────────────────────────
+    // This patches every property bots check to detect headless Chrome
+    await page.evaluateOnNewDocument(() => {
+      // 1. Hide webdriver flag (most basic check)
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+      // 2. Realistic plugins (headless has none by default)
+      const makePlugin = (name, filename, desc) => {
+        const plugin = Object.create(Plugin.prototype);
+        Object.defineProperty(plugin, 'name',        { get: () => name });
+        Object.defineProperty(plugin, 'filename',    { get: () => filename });
+        Object.defineProperty(plugin, 'description', { get: () => desc });
+        Object.defineProperty(plugin, 'length',      { get: () => 0 });
+        return plugin;
+      };
+      try {
+        const plugins = [
+          makePlugin('Chrome PDF Plugin',           'internal-pdf-viewer',  'Portable Document Format'),
+          makePlugin('Chrome PDF Viewer',           'mhjfbmdgcfjbbpaeojofohoefgiehjai', ''),
+          makePlugin('Native Client',               'internal-nacl-plugin', ''),
+        ];
+        Object.defineProperty(navigator, 'plugins', { get: () => plugins });
+        Object.defineProperty(navigator, 'mimeTypes', { get: () => ({ length: 4 }) });
+      } catch(e) {}
+
+      // 3. Real language settings
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+      // 4. Hardware concurrency (headless often returns 1)
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+
+      // 5. Device memory
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+      // 6. Platform
+      Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+
+      // 7. Chrome runtime object (missing in headless)
+      window.chrome = {
+        app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+        runtime: {
+          OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+          OnRestartRequiredReason: { APP_UPDATE: 'app_update', GC_PRESSURE: 'gc_pressure', OS_UPDATE: 'os_update' },
+          PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+          PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+          PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+          RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+        },
+      };
+
+      // 8. Permissions API (headless returns different results)
+      const originalQuery = window.navigator.permissions?.query;
+      if (originalQuery) {
+        window.navigator.permissions.query = (params) =>
+          params.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(params);
+      }
+
+      // 9. WebGL vendor/renderer (headless returns SwiftShader which bots check)
+      try {
+        const getParam = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(param) {
+          if (param === 37445) return 'Intel Inc.';
+          if (param === 37446) return 'Intel Iris OpenGL Engine';
+          return getParam.call(this, param);
+        };
+      } catch(e) {}
+
+      // 10. Screen dimensions (headless uses defaults)
+      Object.defineProperty(window, 'outerWidth',  { get: () => 1920 });
+      Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
+      Object.defineProperty(window, 'screenX',     { get: () => 0 });
+      Object.defineProperty(window, 'screenY',     { get: () => 0 });
+    });
+
+    // Set realistic viewport
+    await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
 
     await page.setRequestInterception(true);
 
-    // Block junk resources to speed up loading
-    const BLOCK_TYPES = new Set(['font','stylesheet','media','websocket','eventsource','manifest']);
-    const BLOCK_DOMAINS = ['google-analytics.com','googletagmanager.com','doubleclick.net','facebook.net','hotjar.com','segment.com','intercom.io'];
+    // Block unnecessary resources (keep stylesheet — some bot detectors check CSS loads)
+    const BLOCK_TYPES = new Set(['font','media','websocket','eventsource','manifest']);
+    const BLOCK_DOMAINS = ['google-analytics.com','googletagmanager.com','doubleclick.net','facebook.net','hotjar.com','segment.com','intercom.io','clarity.ms','mouseflow.com','fullstory.com'];
 
     page.on('request', req => {
       const rt  = req.resourceType();
@@ -438,18 +533,47 @@ async function crawlSite(browser, rawUrl) {
       } catch { /* ignore */ }
     });
 
-    // ── Navigate ──────────────────────────────────────────────────────────────
-    try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
-    } catch {
-      if (!done) {
+    // ── Navigate — 4-level fallback chain ────────────────────────────────────
+    let navSuccess = done; // if already done from headers, skip nav errors
+    if (!navSuccess) {
+      const attempts = [
+        // 1st: https with domcontentloaded
+        { url: url, opts: { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT } },
+        // 2nd: https with just a commit (first byte received) — works for slow sites
+        { url: url, opts: { waitUntil: 'commit', timeout: 25000 } },
+        // 3rd: http fallback (some sites redirect https→http)
+        { url: url.replace(/^https:/i, 'http:'), opts: { waitUntil: 'domcontentloaded', timeout: 20000 } },
+        // 4th: http with commit only
+        { url: url.replace(/^https:/i, 'http:'), opts: { waitUntil: 'commit', timeout: 15000 } },
+      ];
+
+      let lastError = null;
+      for (const attempt of attempts) {
+        if (done) { navSuccess = true; break; } // CDN already found, stop trying
         try {
-          const http = url.replace(/^https:/i, 'http:');
-          await page.goto(http, { waitUntil: 'domcontentloaded', timeout: 12000 });
+          await page.goto(attempt.url, attempt.opts);
+          navSuccess = true;
+          break;
         } catch (e) {
-          await page.close().catch(() => {});
-          return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: `Could not open: ${e.message}`, reason: `Could not open site: ${e.message}` };
+          lastError = e;
+          // If we already captured some images/signals, that's good enough
+          if (imageCount > 0 || serverHeader || damFromUrl) { navSuccess = true; break; }
         }
+      }
+
+      if (!navSuccess) {
+        await page.close().catch(() => {});
+        const errMsg = lastError?.message || 'Unknown navigation error';
+        const reason = errMsg.includes('CERT') || errMsg.includes('SSL') || errMsg.includes('certificate')
+          ? `SSL/Certificate error: ${errMsg}`
+          : errMsg.includes('timeout') || errMsg.includes('Timeout')
+          ? `Page too slow to load (timeout after ${PAGE_TIMEOUT/1000}s)`
+          : errMsg.includes('ERR_NAME_NOT_RESOLVED') || errMsg.includes('DNS')
+          ? `Domain not found (DNS error)`
+          : errMsg.includes('ERR_CONNECTION_REFUSED')
+          ? `Connection refused — site may be down`
+          : `Could not open site: ${errMsg}`;
+        return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', bestImageUrl: null, confidence: 'Low', detail: reason, reason };
       }
     }
 
@@ -467,18 +591,33 @@ async function crawlSite(browser, rawUrl) {
       } catch { /* ignore */ }
     }
 
-    // ── Wait + scroll if not done ─────────────────────────────────────────────
+    // ── Simulate human behaviour: mouse move + scroll ───────────────────────
     if (!done) {
       await new Promise(r => setTimeout(r, AFTER_WAIT));
       try {
+        // Move mouse randomly — bots never move the mouse
+        await page.mouse.move(
+          400 + Math.floor(Math.random() * 400),
+          300 + Math.floor(Math.random() * 200)
+        );
+        await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
+        await page.mouse.move(
+          200 + Math.floor(Math.random() * 600),
+          200 + Math.floor(Math.random() * 400)
+        );
+        await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
+
+        // Scroll with human-like variable speed
         await page.evaluate(async (maxPx) => {
           await new Promise(resolve => {
             let total = 0;
             const t = setInterval(() => {
-              window.scrollBy(0, 300);
-              total += 300;
+              // Variable scroll distance like a human
+              const step = 200 + Math.floor(Math.random() * 200);
+              window.scrollBy(0, step);
+              total += step;
               if (total >= maxPx) { clearInterval(t); resolve(); }
-            }, 80);
+            }, 100 + Math.floor(Math.random() * 80));
           });
         }, SCROLL_PX);
         await new Promise(r => setTimeout(r, 1000));
@@ -546,7 +685,8 @@ app.post('/crawl-stream', async (req, res) => {
     browser = await puppeteer.launch({
       headless: 'new',
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
-      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process','--disable-blink-features=AutomationControlled'],
+      ignoreHTTPSErrors: true,
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process','--disable-blink-features=AutomationControlled','--ignore-certificate-errors','--ignore-certificate-errors-spki-list'],
     });
 
     const queue  = [...entries.map((e, i) => ({ ...e, i }))];
@@ -606,7 +746,8 @@ app.post('/crawl', async (req, res) => {
   const browser = await puppeteer.launch({
     headless: 'new',
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process','--disable-blink-features=AutomationControlled'],
+    ignoreHTTPSErrors: true,
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process','--disable-blink-features=AutomationControlled','--ignore-certificate-errors'],
   });
 
   try {
