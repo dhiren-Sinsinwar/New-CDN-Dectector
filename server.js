@@ -7,206 +7,229 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const MAX_IMAGES   = 200;
-const PARALLEL     = 4;
-const PAGE_TIMEOUT = 20000;
-const AFTER_WAIT   = 1500;
-const SCROLL_PX    = 4000;
+const MAX_IMAGES   = 200;   // max images to check per page
+const PARALLEL     = 4;     // concurrent crawls
+const PAGE_TIMEOUT = 20000; // 20s per page load
+const AFTER_WAIT   = 1500;  // wait after load for lazy images
+const SCROLL_PX    = 5000;  // scroll depth
 
-// ── CDN URL patterns (expanded from analyzer.py) ──────────────────────────────
-// Each entry: [urlFragment, displayName]
+// ── CDN URL patterns ──────────────────────────────────────────────────────────
 const CDN_URL_PATTERNS = [
-  // Imgix
   ['imgix.net',             'Imgix'],
   ['.imgix.',               'Imgix'],
   ['ix.imgix',              'Imgix'],
   ['imgix.com',             'Imgix'],
   ['ixlib=',                'Imgix'],
-  // Cloudinary
   ['res.cloudinary.com',    'Cloudinary'],
   ['cloudinary.com',        'Cloudinary'],
   ['images.cloudinary',     'Cloudinary'],
   ['cloudinary.net',        'Cloudinary'],
-  // ImageKit
   ['ik.imagekit.io',        'ImageKit'],
   ['imagekit.io',           'ImageKit'],
-  ['imagekit',              'ImageKit'],
-  // Gumlet
   ['gumlet.io',             'Gumlet'],
   ['gumlet',                'Gumlet'],
-  // Scene7 / Adobe Dynamic Media
-  ['scene7.com',            'Scene7'],
-  ['scene7',                'Scene7'],
-  // Cloudimage
+  ['scene7.com',            'Scene7 (Adobe DM)'],
   ['cloudimage.io',         'Cloudimage'],
   ['cloudimg.io',           'Cloudimage'],
-  ['cloudimage',            'Cloudimage'],
-  ['cloudimg',              'Cloudimage'],
-  // ImageEngine
   ['imageengine.io',        'ImageEngine'],
   ['imgeng.in',             'ImageEngine'],
-  ['imgeng',                'ImageEngine'],
-  ['imageengine',           'ImageEngine'],
-  // Sirv
   ['sirv.com',              'Sirv'],
-  // Twicpics
   ['twicpics.com',          'Twicpics'],
-  // Fastly
   ['fastly.net',            'Fastly'],
   ['fastly.com',            'Fastly'],
-  // Akamai
   ['akamaized.net',         'Akamai'],
   ['akamai.net',            'Akamai'],
   ['akamaitech.net',        'Akamai'],
-  ['akamai',                'Akamai'],
-  // Cloudflare
   ['cloudflare.com',        'Cloudflare'],
-  ['cdn.cloudflare',        'Cloudflare'],
-  // AWS CloudFront
-  ['cloudfront.net',        'CloudFront'],
-  // AWS S3
+  ['cloudfront.net',        'AWS CloudFront'],
   ['amazonaws.com',         'AWS S3'],
-  ['s3.amazonaws',          'AWS S3'],
-  // Google Cloud CDN / Firebase
   ['googleusercontent.com', 'Google Cloud'],
   ['storage.googleapis.com','Google Cloud Storage'],
   ['firebasestorage',       'Firebase Storage'],
-  // Azure CDN
   ['azureedge.net',         'Azure CDN'],
   ['azurefd.net',           'Azure Front Door'],
-  ['blob.core.windows.net', 'Azure Blob'],
-  // Bunny CDN
+  ['blob.core.windows.net', 'Azure Blob Storage'],
   ['b-cdn.net',             'Bunny CDN'],
   ['bunnycdn.com',          'Bunny CDN'],
   ['bunny.net',             'Bunny CDN'],
-  // KeyCDN
   ['kxcdn.com',             'KeyCDN'],
-  // Uploadcare
   ['ucarecdn.com',          'Uploadcare'],
   ['uploadcare.com',        'Uploadcare'],
-  // Storyblok
-  ['storyblok.com',         'Storyblok'],
-  ['a.storyblok',           'Storyblok'],
-  // Contentful
-  ['ctfassets.net',         'Contentful'],
-  // Shopify CDN
+  ['storyblok.com',         'Storyblok CDN'],
+  ['a.storyblok',           'Storyblok CDN'],
+  ['ctfassets.net',         'Contentful CDN'],
   ['cdn.shopify.com',       'Shopify CDN'],
   ['shopifycdn.com',        'Shopify CDN'],
-  // WordPress.com / Jetpack CDN
+  ['i0.wp.com',             'Jetpack CDN (WordPress)'],
+  ['i1.wp.com',             'Jetpack CDN (WordPress)'],
+  ['i2.wp.com',             'Jetpack CDN (WordPress)'],
   ['wp.com',                'WordPress CDN'],
-  ['wordpress.com',         'WordPress CDN'],
-  ['i0.wp.com',             'Jetpack CDN'],
-  ['i1.wp.com',             'Jetpack CDN'],
-  ['i2.wp.com',             'Jetpack CDN'],
-  // Wix
   ['wixstatic.com',         'Wix CDN'],
-  ['wix.com',               'Wix CDN'],
-  // Squarespace
   ['squarespace-cdn.com',   'Squarespace CDN'],
   ['sqspcdn.com',           'Squarespace CDN'],
-  // Sanity
-  ['sanity.io',             'Sanity CDN'],
   ['cdn.sanity.io',         'Sanity CDN'],
-  // Prismic
   ['prismic.io',            'Prismic CDN'],
-  // Optimizely / Episerver
-  ['optimizely.com',        'Optimizely CDN'],
-  // Rackspace / Limelight
-  ['limelight.com',         'Limelight CDN'],
-  // StackPath
-  ['stackpathcdn.com',      'StackPath'],
-  // CDN77
+  ['framerusercontent.com', 'Framer CDN'],
+  ['webflow.com',           'Webflow CDN'],
+  ['cdn.prod.website-files','Webflow CDN'],
+  ['datocms-assets.com',    'DatoCMS CDN'],
   ['cdn77.org',             'CDN77'],
-  // MaxCDN / StackPath legacy
-  ['maxcdn.com',            'MaxCDN'],
-  // Verizon / Edgecast
   ['edgecastcdn.net',       'Edgecast CDN'],
+  ['limelight.com',         'Limelight CDN'],
+  ['stackpathcdn.com',      'StackPath CDN'],
 ];
 
 // ── DAM URL patterns ──────────────────────────────────────────────────────────
-// Digital Asset Management platforms
 const DAM_URL_PATTERNS = [
-  // Bynder
-  ['bynder.com',            'Bynder'],
-  ['bynder',                'Bynder'],
-  // Widen (now Acquia DAM)
+  ['bynder.com',            'Bynder DAM'],
+  ['bynder',                'Bynder DAM'],
   ['widen.net',             'Widen / Acquia DAM'],
   ['widencdn.net',          'Widen / Acquia DAM'],
-  ['widen',                 'Widen / Acquia DAM'],
-  // Canto
-  ['canto.com',             'Canto'],
-  ['canto.de',              'Canto'],
-  ['canto',                 'Canto'],
-  // Brandfolder
-  ['brandfolder.com',       'Brandfolder'],
-  ['brandfolder',           'Brandfolder'],
-  // Extensis Portfolio
-  ['extensis.com',          'Extensis Portfolio'],
-  // MediaValet
-  ['mediavalet.com',        'MediaValet'],
-  // Nuxeo
-  ['nuxeo.com',             'Nuxeo'],
-  // Aprimo
-  ['aprimo.com',            'Aprimo'],
-  // Salsify
-  ['salsify.com',           'Salsify'],
-  // Cloudinary DAM (also a CDN)
-  ['cloudinary.com/dam',    'Cloudinary DAM'],
-  // Adobe Experience Manager / AEM DAM
-  ['scene7.com',            'Adobe Experience Manager DAM'],
-  ['/content/dam/',         'Adobe AEM DAM'],
-  ['/dam/',                 'DAM'],
-  // Bynder compact view
-  ['/m/portal',             'Bynder Portal'],
-  // Celum
+  ['canto.com',             'Canto DAM'],
+  ['canto.de',              'Canto DAM'],
+  ['brandfolder.com',       'Brandfolder DAM'],
+  ['mediavalet.com',        'MediaValet DAM'],
+  ['nuxeo.com',             'Nuxeo DAM'],
+  ['aprimo.com',            'Aprimo DAM'],
+  ['salsify.com',           'Salsify DAM'],
   ['celum.com',             'Celum DAM'],
-  // IntelligenceBank
   ['intelligencebank.com',  'IntelligenceBank DAM'],
-  // Acquia
-  ['acquia.com',            'Acquia DAM'],
-  // Webdam
-  ['webdam.com',            'Webdam'],
-  // Percolate
-  ['percolate.com',         'Percolate DAM'],
-  // Lytho
-  ['lytho.com',             'Lytho DAM'],
-  // Third Light
-  ['thirdlight.com',        'Third Light DAM'],
-  // Photoshelter
-  ['photoshelter.com',      'PhotoShelter DAM'],
-  // Asset Bank
-  ['assetbank.co.uk',       'Asset Bank DAM'],
-  // Filecamp
-  ['filecamp.com',          'Filecamp DAM'],
-  // Frontify
+  ['webdam.com',            'Webdam DAM'],
   ['frontify.com',          'Frontify DAM'],
-  // Pimcore
   ['pimcore.com',           'Pimcore DAM'],
-  // OpenAsset
   ['openasset.com',         'OpenAsset DAM'],
+  ['photoshelter.com',      'PhotoShelter DAM'],
+  ['filecamp.com',          'Filecamp DAM'],
+  ['thirdlight.com',        'Third Light DAM'],
+  ['lytho.com',             'Lytho DAM'],
+  ['assetbank.co.uk',       'Asset Bank DAM'],
+  ['/content/dam/',         'Adobe AEM DAM'],
+  ['/dam/',                 'DAM System'],
+  ['scene7.com',            'Adobe Experience Manager DAM'],
 ];
 
-// ── Server header CDN patterns ────────────────────────────────────────────────
-const SERVER_CDN_PATTERNS = [
+// ── Tech stack patterns from image URLs ───────────────────────────────────────
+// These identify what platform/CMS/ecomm the site is built on
+const TECH_STACK_PATTERNS = [
+  // E-commerce platforms
+  ['cdn.shopify.com',           'Shopify'],
+  ['shopifycdn.com',            'Shopify'],
+  ['/cdn/shop/',                'Shopify'],
+  ['myshopify.com',             'Shopify'],
+  ['bigcommerce.com',           'BigCommerce'],
+  ['bcapp.io',                  'BigCommerce'],
+  ['demandware.net',            'Salesforce Commerce Cloud'],
+  ['demandware.edgesuite.net',  'Salesforce Commerce Cloud'],
+  ['commercecloud.salesforce',  'Salesforce Commerce Cloud'],
+  ['magento',                   'Magento'],
+  ['woocommerce',               'WooCommerce'],
+  ['wc-',                       'WooCommerce'],
+  ['squarespace-cdn.com',       'Squarespace'],
+  ['sqspcdn.com',               'Squarespace'],
+  ['wixstatic.com',             'Wix'],
+  ['wix.com',                   'Wix'],
+  // CMS platforms
+  ['/wp-content/',              'WordPress'],
+  ['/wp-includes/',             'WordPress'],
+  ['wordpress.com',             'WordPress'],
+  ['i0.wp.com',                 'WordPress (Jetpack)'],
+  ['ghost.io',                  'Ghost CMS'],
+  ['ghost.org',                 'Ghost CMS'],
+  ['contentful',                'Contentful CMS'],
+  ['ctfassets.net',             'Contentful CMS'],
+  ['prismic.io',                'Prismic CMS'],
+  ['storyblok.com',             'Storyblok CMS'],
+  ['datocms',                   'DatoCMS'],
+  ['sanity.io',                 'Sanity CMS'],
+  ['cdn.sanity.io',             'Sanity CMS'],
+  ['/content/dam/',             'Adobe Experience Manager'],
+  ['scene7.com',                'Adobe Experience Manager'],
+  ['drupal',                    'Drupal CMS'],
+  ['sites/default/files',       'Drupal CMS'],
+  ['craft',                     'Craft CMS'],
+  ['kentico',                   'Kentico CMS'],
+  ['sitecore',                  'Sitecore CMS'],
+  ['episerver',                 'Optimizely (Episerver)'],
+  ['optimizely.com',            'Optimizely'],
+  // Web builders
+  ['webflow.com',               'Webflow'],
+  ['cdn.prod.website-files',    'Webflow'],
+  ['framerusercontent.com',     'Framer'],
+  ['bubble.io',                 'Bubble'],
+  ['cargo.site',                'Cargo'],
+  ['format.com',                'Format'],
+  ['smugmug.com',               'SmugMug'],
+  // Cloud / hosting
+  ['storage.googleapis.com',    'Google Cloud Storage'],
+  ['firebasestorage',           'Firebase'],
+  ['googleusercontent.com',     'Google Cloud'],
+  ['amazonaws.com',             'AWS'],
+  ['cloudfront.net',            'AWS CloudFront'],
+  ['s3.amazonaws',              'AWS S3'],
+  ['blob.core.windows.net',     'Azure'],
+  ['azureedge.net',             'Azure CDN'],
+  // Marketing / analytics platforms
+  ['hubspot.com',               'HubSpot'],
+  ['hs-sites.com',              'HubSpot CMS'],
+  ['hsappstatic.net',           'HubSpot'],
+  ['pardot.com',                'Salesforce Pardot'],
+  ['marketo.com',               'Marketo'],
+  // Media & image platforms
+  ['mux.com',                   'Mux Video'],
+  ['cloudflare-stream.com',     'Cloudflare Stream'],
+  ['imgix.net',                 'Imgix'],
+  ['cloudinary.com',            'Cloudinary'],
+  ['imagekit.io',               'ImageKit'],
+  ['gumlet.io',                 'Gumlet'],
+  ['uploadcare.com',            'Uploadcare'],
+  ['sirv.com',                  'Sirv'],
+  // Social / embeds
+  ['instagram.com',             'Instagram Embed'],
+  ['cdninstagram.com',          'Instagram CDN'],
+  ['twimg.com',                 'Twitter/X CDN'],
+  ['fbcdn.net',                 'Facebook CDN'],
+  ['pinimg.com',                'Pinterest CDN'],
+];
+
+// ── Server header patterns ────────────────────────────────────────────────────
+const SERVER_PATTERNS = [
   ['imgix',         'Imgix'],
   ['cloudinary',    'Cloudinary'],
   ['imagekit',      'ImageKit'],
   ['gumlet',        'Gumlet'],
   ['scene7',        'Scene7'],
-  ['cloudimage',    'Cloudimage'],
-  ['fastly',        'Fastly'],
-  ['akamai',        'Akamai'],
   ['cloudflare',    'Cloudflare'],
-  ['cloudfront',    'CloudFront'],
+  ['cloudfront',    'AWS CloudFront'],
+  ['akamai',        'Akamai'],
+  ['fastly',        'Fastly'],
   ['bunny',         'Bunny CDN'],
-  ['varnish',       'Varnish CDN'],
+  ['varnish',       'Varnish'],
   ['nginx',         'Nginx'],
   ['apache',        'Apache'],
   ['litespeed',     'LiteSpeed'],
   ['openresty',     'OpenResty'],
+  ['vercel',        'Vercel'],
+  ['netlify',       'Netlify'],
+  ['amazons3',      'AWS S3'],
+  ['windows-azure', 'Azure'],
 ];
 
-// ── Detection functions ───────────────────────────────────────────────────────
+// ── CDN priority (specific beats generic) ────────────────────────────────────
+const CDN_PRIORITY = {
+  'Imgix':10,'Cloudinary':10,'ImageKit':10,'Gumlet':10,
+  'Scene7 (Adobe DM)':10,'Cloudimage':10,'ImageEngine':10,'Sirv':10,'Twicpics':10,'Uploadcare':10,
+  'Storyblok CDN':9,'Contentful CDN':9,'Sanity CDN':9,'Prismic CDN':9,
+  'Shopify CDN':8,'Jetpack CDN (WordPress)':7,'WordPress CDN':7,'Wix CDN':7,'Squarespace CDN':7,
+  'Framer CDN':7,'Webflow CDN':7,'DatoCMS CDN':7,
+  'Firebase Storage':6,'Google Cloud Storage':6,'AWS S3':6,'Azure Blob Storage':6,
+  'Bunny CDN':5,'KeyCDN':5,
+  'AWS CloudFront':4,'Akamai':4,'Fastly':4,'Azure CDN':4,'Azure Front Door':4,
+  'Cloudflare':2,
+  'Nginx':1,'Apache':1,'LiteSpeed':1,'Varnish':1,
+};
+function getCDNPriority(name) { return CDN_PRIORITY[name] || 3; }
+
+// ── Detection helpers ─────────────────────────────────────────────────────────
 function detectCDNFromUrl(url) {
   const lower = url.toLowerCase();
   for (const [pattern, name] of CDN_URL_PATTERNS) {
@@ -223,19 +246,22 @@ function detectDAMFromUrl(url) {
   return null;
 }
 
-function detectFromServerHeader(headers = {}) {
-  const serverVal = [
-    headers['server'],
-    headers['x-server'],
-    headers['x-served-by'],
-    headers['x-cdn'],
-    headers['via'],
-    headers['x-cache'],
-    headers['x-powered-by'],
-  ].filter(Boolean).join(' ').toLowerCase();
+function detectTechStackFromUrl(url) {
+  const lower = url.toLowerCase();
+  const found = new Set();
+  for (const [pattern, name] of TECH_STACK_PATTERNS) {
+    if (lower.includes(pattern.toLowerCase())) found.add(name);
+  }
+  return [...found];
+}
 
-  for (const [pattern, name] of SERVER_CDN_PATTERNS) {
-    if (serverVal.includes(pattern.toLowerCase())) return { name, raw: serverVal };
+function detectFromServerHeader(headers = {}) {
+  const str = [
+    headers['server'], headers['x-server'], headers['x-served-by'],
+    headers['via'], headers['x-cache'], headers['x-cdn'], headers['x-powered-by'],
+  ].filter(Boolean).join(' ').toLowerCase();
+  for (const [pattern, name] of SERVER_PATTERNS) {
+    if (str.includes(pattern.toLowerCase())) return name;
   }
   return null;
 }
@@ -257,13 +283,12 @@ const IMAGE_TYPES = [
 ];
 function isImgCT(ct = '') { return IMAGE_TYPES.some(t => ct.toLowerCase().includes(t)); }
 
-// ── URLs to NEVER save as matched URL ───────────────────────────────────────
+// ── Excluded URLs (bot challenges, trackers, etc.) ────────────────────────────
 const EXCLUDED_URL_PATTERNS = [
   /challenges\.cloudflare\.com/i,
   /cdn-cgi\/challenge/i,
   /cdn-cgi\//i,
   /pixel\.wp\.com\/g\.gif/i,
-  /\.wp\.com\/g\.gif/i,
   /google-analytics\.com/i,
   /googletagmanager\.com/i,
   /\/beacon\./i,
@@ -274,76 +299,110 @@ const EXCLUDED_URL_PATTERNS = [
   /1x1\.gif/i,
   /\/favicon\.ico/i,
   /cdnjs\.cloudflare\.com/i,
+  /hubspot\.com\/__ptq/i,
+  /track\.hubspot/i,
 ];
 function isExcludedUrl(url) { return EXCLUDED_URL_PATTERNS.some(p => p.test(url)); }
 
-// ── CDN priority — specific image CDNs beat generic infrastructure ───────────
-const CDN_PRIORITY = {
-  'Imgix':10,'Cloudinary':10,'ImageKit':10,'Gumlet':10,'Scene7':10,
-  'Cloudimage':10,'ImageEngine':10,'Sirv':10,'Twicpics':10,'Uploadcare':10,
-  'Storyblok':9,'Contentful':9,'Sanity CDN':9,'Prismic CDN':9,
-  'Shopify CDN':8,'WordPress CDN':7,'Jetpack CDN':7,'Wix CDN':7,'Squarespace CDN':7,
-  'Firebase Storage':6,'Google Cloud Storage':6,'AWS S3':6,'Azure Blob':6,
-  'Bunny CDN':5,'KeyCDN':5,'CloudFront':4,'Akamai':4,'Fastly':4,
-  'Azure CDN':4,'Azure Front Door':4,
-  'Cloudflare':2,'Nginx':1,'Apache':1,'LiteSpeed':1,'Varnish CDN':1,
-};
-function getCDNPriority(name) { return CDN_PRIORITY[name] || 3; }
-
-// ── Cookie / modal bypass texts (from analyzer.py) ───────────────────────────
+// ── Cookie texts ──────────────────────────────────────────────────────────────
 const COOKIE_TEXTS = [
   'accept all','accept','allow all','allow cookies','accept cookies',
   'i agree','agree','got it','continue','ok','okay','yes, i agree',
   'confirm my choices','save preferences','allow','accept & continue',
   'agree & continue','accept all cookies','allow all cookies',
-  'understand','dismiss','consent','got it!','continue shopping',
+  'understand','dismiss','consent','continue shopping',
 ];
+
+// ── Inner page priority patterns ──────────────────────────────────────────────
+const INNER_PAGE_PRIORITY = [
+  // Priority 5 — product/shop/category (richest images)
+  { score: 5, re: /\/(shop|store|products?|collections?|catalogue|catalog|category|categories|range|ranges|buy)/i },
+  // Priority 4 — portfolio/gallery
+  { score: 4, re: /\/(portfolio|gallery|galleries|work|projects?|case-studies|showcase)/i },
+  // Priority 3 — solutions/services/features
+  { score: 3, re: /\/(solutions?|services?|features?|platform|offerings?|industries)/i },
+  // Priority 2 — about/team/news
+  { score: 2, re: /\/(about|team|news|press|media|resources?|insights?|blog)/i },
+  // Priority 1 — any other inner page
+  { score: 1, re: /.+/ },
+];
+const SKIP_PATHS = /\/(login|signin|sign-in|signup|sign-up|register|cart|checkout|account|logout|admin|api|cdn|static|assets|wp-admin|wp-json|sitemap|feed|rss|robots)/i;
 
 // ── Crawl a single site ───────────────────────────────────────────────────────
 async function crawlSite(browser, rawUrl) {
   const url = normalise(rawUrl);
   if (!url) return {
     cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available',
-    matchedUrl: '', confidence: 'Low', detail: 'Invalid URL',
-    reason: 'Invalid or missing URL',
+    techStack: '', matchedUrl: '', confidence: 'Low',
+    detail: 'Invalid URL', reason: 'Invalid or missing URL',
   };
 
-  let imageCount   = 0;
-  let done         = false;
+  // ── Collected signals ─────────────────────────────────────────────────────
+  let networkImageCount = 0;  // images from Network tab (Img filter)
+  let domImageCount     = 0;  // images from Elements tab (DOM)
+  let done              = false;
 
-  // Results we collect
-  let cdnFromUrl   = null;  // CDN identified from image URL
-  let serverHeader = null;  // raw server header value
-  let serverCDN    = null;  // CDN identified from server header
-  let damFromUrl   = null;  // DAM identified from any URL
-  let matchedUrl   = null;  // the exact image URL that triggered CDN detection
-  let bestImageUrl = null;  // best real image URL seen (fallback when matchedUrl is empty)
+  let cdnFromUrl   = null;
+  let serverHeader = null;
+  let serverCDN    = null;
+  let damFromUrl   = null;
+  let matchedUrl   = null;
+  let bestImageUrl = null;
+  const techStackSet = new Set();  // all tech stack signals collected
   let page;
+
+  // ── Process a single image URL (shared between DOM and Network scans) ─────
+  function processImageUrl(imgUrl, source) {
+    if (!imgUrl || isExcludedUrl(imgUrl)) return;
+
+    // CDN detection
+    const urlCDN = detectCDNFromUrl(imgUrl);
+    if (urlCDN) {
+      const newP = getCDNPriority(urlCDN);
+      const curP = cdnFromUrl ? getCDNPriority(cdnFromUrl) : -1;
+      if (newP > curP) {
+        cdnFromUrl = urlCDN;
+        if (!isExcludedUrl(imgUrl)) matchedUrl = imgUrl;
+      } else if (newP === curP && !matchedUrl) {
+        matchedUrl = imgUrl;
+      }
+    }
+
+    // DAM detection
+    const dam = detectDAMFromUrl(imgUrl);
+    if (dam && !damFromUrl) damFromUrl = dam;
+
+    // Tech stack detection
+    const stacks = detectTechStackFromUrl(imgUrl);
+    stacks.forEach(s => techStackSet.add(s));
+
+    // Track best real content image for fallback URL
+    if (imgUrl.startsWith('http') && !isExcludedUrl(imgUrl)) {
+      const isContent = /\.(jpg|jpeg|png|webp|gif|avif)/i.test(imgUrl) &&
+        !/favicon|icon|logo|pixel|spacer|blank|1x1|sprite/i.test(imgUrl);
+      if (!bestImageUrl || isContent) bestImageUrl = imgUrl;
+    }
+  }
 
   try {
     page = await browser.newPage();
 
-    // Ignore SSL certificate errors (expired certs, self-signed, invalid dates)
     await page.setBypassCSP(true);
     await page._client().send('Security.setIgnoreCertificateErrors', { ignore: true }).catch(() => {});
 
-    // Pick UA consistent per domain
+    // Consistent UA per domain
     const domain = new URL(url).hostname;
     const UAS = [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
     ];
     let hash = 0;
     for (const c of domain) hash = (hash * 31 + c.charCodeAt(0)) & 0xffffffff;
-    const ua = UAS[Math.abs(hash) % UAS.length];
+    await page.setUserAgent(UAS[Math.abs(hash) % UAS.length]);
 
-    await page.setUserAgent(ua);
-
-    // ── Full realistic browser headers ───────────────────────────────────────
-    // Bots get detected when headers don't match what a real Chrome sends
     await page.setExtraHTTPHeaders({
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
@@ -360,93 +419,35 @@ async function crawlSite(browser, rawUrl) {
       'Upgrade-Insecure-Requests': '1',
     });
 
-    // ── Deep navigator/window spoofing ────────────────────────────────────────
-    // This patches every property bots check to detect headless Chrome
     await page.evaluateOnNewDocument(() => {
-      // 1. Hide webdriver flag (most basic check)
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
-
-      // 2. Realistic plugins (headless has none by default)
-      const makePlugin = (name, filename, desc) => {
-        const plugin = Object.create(Plugin.prototype);
-        Object.defineProperty(plugin, 'name',        { get: () => name });
-        Object.defineProperty(plugin, 'filename',    { get: () => filename });
-        Object.defineProperty(plugin, 'description', { get: () => desc });
-        Object.defineProperty(plugin, 'length',      { get: () => 0 });
-        return plugin;
-      };
-      try {
-        const plugins = [
-          makePlugin('Chrome PDF Plugin',           'internal-pdf-viewer',  'Portable Document Format'),
-          makePlugin('Chrome PDF Viewer',           'mhjfbmdgcfjbbpaeojofohoefgiehjai', ''),
-          makePlugin('Native Client',               'internal-nacl-plugin', ''),
-        ];
-        Object.defineProperty(navigator, 'plugins', { get: () => plugins });
-        Object.defineProperty(navigator, 'mimeTypes', { get: () => ({ length: 4 }) });
-      } catch(e) {}
-
-      // 3. Real language settings
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-
-      // 4. Hardware concurrency (headless often returns 1)
       Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-
-      // 5. Device memory
       Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-
-      // 6. Platform
       Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-
-      // 7. Chrome runtime object (missing in headless)
-      window.chrome = {
-        app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
-        runtime: {
-          OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
-          OnRestartRequiredReason: { APP_UPDATE: 'app_update', GC_PRESSURE: 'gc_pressure', OS_UPDATE: 'os_update' },
-          PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-          PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-          PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
-          RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
-        },
-      };
-
-      // 8. Permissions API (headless returns different results)
-      const originalQuery = window.navigator.permissions?.query;
-      if (originalQuery) {
-        window.navigator.permissions.query = (params) =>
-          params.name === 'notifications'
-            ? Promise.resolve({ state: Notification.permission })
-            : originalQuery(params);
-      }
-
-      // 9. WebGL vendor/renderer (headless returns SwiftShader which bots check)
+      window.chrome = { runtime: {}, app: { isInstalled: false } };
       try {
         const getParam = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(param) {
-          if (param === 37445) return 'Intel Inc.';
-          if (param === 37446) return 'Intel Iris OpenGL Engine';
-          return getParam.call(this, param);
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+          if (p === 37445) return 'Intel Inc.';
+          if (p === 37446) return 'Intel Iris OpenGL Engine';
+          return getParam.call(this, p);
         };
       } catch(e) {}
-
-      // 10. Screen dimensions (headless uses defaults)
       Object.defineProperty(window, 'outerWidth',  { get: () => 1920 });
       Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
-      Object.defineProperty(window, 'screenX',     { get: () => 0 });
-      Object.defineProperty(window, 'screenY',     { get: () => 0 });
     });
 
-    // Set realistic viewport
     await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
-
     await page.setRequestInterception(true);
 
-    // Block unnecessary resources (keep stylesheet — some bot detectors check CSS loads)
     const BLOCK_TYPES = new Set(['font','media','websocket','eventsource','manifest']);
-    const BLOCK_DOMAINS = ['google-analytics.com','googletagmanager.com','doubleclick.net','facebook.net','hotjar.com','segment.com','intercom.io','clarity.ms','mouseflow.com','fullstory.com'];
+    const BLOCK_DOMAINS = ['google-analytics.com','googletagmanager.com','doubleclick.net',
+      'facebook.net','hotjar.com','segment.com','intercom.io','clarity.ms',
+      'mouseflow.com','fullstory.com','mixpanel.com'];
 
     page.on('request', req => {
-      const rt  = req.resourceType();
+      const rt = req.resourceType();
       const rUrl = req.url();
       if (BLOCK_TYPES.has(rt)) { req.abort(); return; }
       if (BLOCK_DOMAINS.some(d => rUrl.includes(d))) { req.abort(); return; }
@@ -454,7 +455,8 @@ async function crawlSite(browser, rawUrl) {
       req.continue();
     });
 
-    // ── Main response handler — DevTools Network → Img tab ────────────────────
+    // ── NETWORK TAB SCAN: intercept all image responses ───────────────────────
+    // Equivalent to DevTools → Network → Img filter
     page.on('response', async response => {
       if (done) return;
       try {
@@ -464,101 +466,61 @@ async function crawlSite(browser, rawUrl) {
         const ct      = headers['content-type'] || '';
         const rt      = response.request().resourceType();
 
-        // ── Check ALL responses for DAM signals (not just images) ────────────
-        const damSignal = detectDAMFromUrl(resUrl);
-        if (damSignal && !damFromUrl) damFromUrl = damSignal;
+        // Check ALL responses for DAM/tech signals
+        const dam = detectDAMFromUrl(resUrl);
+        if (dam && !damFromUrl) damFromUrl = dam;
+        detectTechStackFromUrl(resUrl).forEach(s => techStackSet.add(s));
 
-        // ── Only process image responses below ────────────────────────────────
+        // Only process image responses (Network → Img tab)
         if ((rt !== 'image' && !isImgCT(ct)) || status < 200 || status >= 400) return;
 
-        imageCount++;
-
-        // ── Image cap ────────────────────────────────────────────────────────
-        if (imageCount > MAX_IMAGES) {
+        networkImageCount++;
+        if (networkImageCount > MAX_IMAGES) {
           done = true;
           page.evaluate(() => window.stop()).catch(() => {});
           return;
         }
 
-        // ── Track the best real image URL seen so far (fallback for matchedUrl) ─
-        // Prefer larger images — skip tiny icons/SVG logos/trackers
-        if (!isExcludedUrl(resUrl) && resUrl.startsWith('http')) {
-          // Prefer URLs that look like real content images over logos/icons
-          const isLikelyContent = /\.(jpg|jpeg|png|webp|gif|avif)/i.test(resUrl) &&
-            !/favicon|icon|logo|pixel|spacer|blank|1x1|sprite/i.test(resUrl);
-          if (!bestImageUrl || isLikelyContent) {
-            bestImageUrl = resUrl;
-          }
-        }
-
-        // ── Extract server header from this image response ────────────────────
-        const rawServer = extractServerHeader(headers);
-        if (rawServer && !serverHeader) serverHeader = rawServer;
-
-        // ── Check server headers for CDN ──────────────────────────────────────
+        // Extract server header from image response
+        const rawSvr = extractServerHeader(headers);
+        if (rawSvr && !serverHeader) serverHeader = rawSvr;
         const svrCDN = detectFromServerHeader(headers);
-        if (svrCDN && !serverCDN) serverCDN = svrCDN.name;
+        if (svrCDN && !serverCDN) serverCDN = svrCDN;
 
-        // ── Check image URL for CDN ───────────────────────────────────────────
-        const urlCDN = detectCDNFromUrl(resUrl);
-        if (urlCDN) {
-          const newPriority = getCDNPriority(urlCDN);
-          const curPriority = cdnFromUrl ? getCDNPriority(cdnFromUrl) : -1;
+        // Process the image URL
+        processImageUrl(resUrl, 'network');
 
-          // Use this CDN if it has higher priority than what we found before
-          // AND the URL is not a bot-protection/tracking URL
-          if (newPriority > curPriority) {
-            cdnFromUrl = urlCDN;
-            // Only save matchedUrl if it's a real content URL (not challenge/tracker)
-            if (!isExcludedUrl(resUrl)) {
-              matchedUrl = resUrl;
-            }
-          } else if (newPriority === curPriority && !matchedUrl && !isExcludedUrl(resUrl)) {
-            // Same priority but no URL saved yet — save this one
-            matchedUrl = resUrl;
-          }
-        }
-
-        // ── Also check image URL for DAM ──────────────────────────────────────
-        const imgDam = detectDAMFromUrl(resUrl);
-        if (imgDam && !damFromUrl) damFromUrl = imgDam;
-
-        // ── Early stop: high-priority CDN confirmed with a real URL ───────────
+        // Early stop if high-priority CDN found
         if (cdnFromUrl && matchedUrl && getCDNPriority(cdnFromUrl) >= 8) {
           done = true;
-          console.log(`[CDN] ✅ ${cdnFromUrl} (priority ${getCDNPriority(cdnFromUrl)}) on image #${imageCount} — stopping`);
+          console.log(`[CDN] ✅ ${cdnFromUrl} via Network tab on image #${networkImageCount}`);
           page.evaluate(() => window.stop()).catch(() => {});
         }
-
       } catch { /* ignore */ }
     });
 
-    // ── Helper: navigate with fallback chain ────────────────────────────────
+    // ── Helper: navigate with fallback chain ──────────────────────────────────
     async function navigateTo(targetUrl) {
       const attempts = [
-        { url: targetUrl,                                    opts: { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT } },
-        { url: targetUrl,                                    opts: { waitUntil: 'commit',           timeout: 25000 } },
-        { url: targetUrl.replace(/^https:/i, 'http:'),      opts: { waitUntil: 'domcontentloaded', timeout: 20000 } },
-        { url: targetUrl.replace(/^https:/i, 'http:'),      opts: { waitUntil: 'commit',           timeout: 15000 } },
+        { url: targetUrl,                               opts: { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT } },
+        { url: targetUrl,                               opts: { waitUntil: 'commit',           timeout: 25000 } },
+        { url: targetUrl.replace(/^https:/i, 'http:'), opts: { waitUntil: 'domcontentloaded', timeout: 20000 } },
+        { url: targetUrl.replace(/^https:/i, 'http:'), opts: { waitUntil: 'commit',           timeout: 15000 } },
       ];
-      let lastError = null;
-      for (const attempt of attempts) {
+      let lastErr = null;
+      for (const a of attempts) {
         if (done) return true;
-        try { await page.goto(attempt.url, attempt.opts); return true; }
-        catch (e) {
-          lastError = e;
-          if (imageCount > 0 || serverHeader || damFromUrl) return true;
-        }
+        try { await page.goto(a.url, a.opts); return true; }
+        catch (e) { lastErr = e; if (networkImageCount > 0 || serverHeader) return true; }
       }
-      throw lastError || new Error('Navigation failed');
+      throw lastErr || new Error('Navigation failed');
     }
 
     // ── Helper: dismiss cookie banners ────────────────────────────────────────
     async function dismissCookies() {
       try {
         await page.evaluate((texts) => {
-          const els = document.querySelectorAll('button, a, [role="button"]');
-          for (const el of els) {
+          for (const el of document.querySelectorAll('button, a, [role="button"]')) {
             if (texts.includes(el.innerText?.toLowerCase().trim())) { el.click(); return; }
           }
         }, COOKIE_TEXTS);
@@ -578,168 +540,291 @@ async function crawlSite(browser, rawUrl) {
               window.scrollBy(0, 200 + Math.floor(Math.random()*200));
               total += 300;
               if (total >= px) { clearInterval(t); res(); }
-            }, 100 + Math.floor(Math.random()*80));
+            }, 80 + Math.floor(Math.random()*60));
           });
         }, maxPx);
         await new Promise(r => setTimeout(r, 800));
       } catch { /* page may have stopped */ }
     }
 
-    // ── Helper: find best inner page link from homepage ───────────────────────
-    // Priority: product/category/collection > about/blog > any inner page
-    // Skips: login, cart, checkout, external links
-    async function findInnerPageUrl(baseUrl) {
-      const base = new URL(baseUrl);
-      const PRIORITY_PATTERNS = [
-        // Highest — product/shop/category pages have the most real images
-        /\/(shop|store|products?|collections?|catalogue|catalog|category|categories|range|ranges|buy|purchase)/i,
-        // High — portfolio, gallery, case studies
-        /\/(portfolio|gallery|galleries|work|projects?|case-studies|showcase)/i,
-        // Medium — solutions, services, features
-        /\/(solutions?|services?|features?|platform|offerings?)/i,
-        // Lower — about, team, news
-        /\/(about|team|news|press|media|resources?|insights?|blog)/i,
-      ];
-      const SKIP_PATTERNS = /\/(login|signin|sign-in|signup|sign-up|register|cart|checkout|account|logout|admin|api|cdn|static|assets|wp-admin|wp-json)/i;
-
+    // ── Helper: DOM ELEMENTS SCAN ─────────────────────────────────────────────
+    // Equivalent to DevTools → Elements tab — scans all image URLs in the DOM
+    async function scanDOMElements() {
       try {
-        const links = await page.evaluate((baseOrigin) => {
+        const domUrls = await page.evaluate(() => {
+          const urls = new Set();
+          const base = window.location.origin;
+
+          // 1. <img> src, srcset, data-src, data-lazy-src, data-original
+          document.querySelectorAll('img').forEach(img => {
+            ['src','srcset','data-src','data-lazy-src','data-original',
+             'data-srcset','data-lazy','data-bg','data-background'].forEach(attr => {
+              const val = img.getAttribute(attr);
+              if (val) val.split(',').forEach(p => {
+                const u = p.trim().split(/\s+/)[0];
+                if (u && u.startsWith('http')) urls.add(u);
+              });
+            });
+          });
+
+          // 2. <source> srcset (picture element)
+          document.querySelectorAll('source').forEach(src => {
+            const val = src.getAttribute('srcset') || src.getAttribute('data-srcset') || '';
+            val.split(',').forEach(p => {
+              const u = p.trim().split(/\s+/)[0];
+              if (u && u.startsWith('http')) urls.add(u);
+            });
+          });
+
+          // 3. CSS background-image in style attributes
+          document.querySelectorAll('[style]').forEach(el => {
+            const style = el.getAttribute('style') || '';
+            const matches = style.match(/url\(['"]?(https?[^'")\s]+)['"]?\)/gi) || [];
+            matches.forEach(m => {
+              const u = m.replace(/url\(['"]?/i,'').replace(/['"]?\)$/,'');
+              if (u.startsWith('http')) urls.add(u);
+            });
+          });
+
+          // 4. Inline <style> blocks — background-image declarations
+          document.querySelectorAll('style').forEach(styleEl => {
+            const text = styleEl.textContent || '';
+            const matches = text.match(/url\(['"]?(https?[^'")\s]+)['"]?\)/gi) || [];
+            matches.forEach(m => {
+              const u = m.replace(/url\(['"]?/i,'').replace(/['"]?\)$/,'');
+              if (u.startsWith('http')) urls.add(u);
+            });
+          });
+
+          // 5. Computed styles — gets background images set via CSS classes
+          document.querySelectorAll('div, section, article, header, span, a').forEach(el => {
+            try {
+              const bg = window.getComputedStyle(el).backgroundImage;
+              if (bg && bg !== 'none') {
+                const m = bg.match(/url\(['"]?(https?[^'")\s]+)['"]?\)/);
+                if (m && m[1]) urls.add(m[1]);
+              }
+            } catch { /* ignore */ }
+          });
+
+          // 6. <script> JSON blobs — image URLs embedded in JS data
+          document.querySelectorAll('script').forEach(s => {
+            const text = s.textContent || '';
+            const matches = text.match(/https?:\/\/[^\s"'<>]+\.(?:jpg|jpeg|png|webp|gif|avif|svg)[^\s"'<>]*/gi) || [];
+            matches.forEach(u => urls.add(u));
+          });
+
+          // 7. data-* attributes on any element (lazy loaders use these)
+          document.querySelectorAll('[data-image],[data-img],[data-background-image],[data-bg-image]').forEach(el => {
+            ['data-image','data-img','data-background-image','data-bg-image'].forEach(attr => {
+              const val = el.getAttribute(attr);
+              if (val && val.startsWith('http')) urls.add(val);
+            });
+          });
+
+          return [...urls].slice(0, 300);
+        });
+
+        console.log(`[CDN] DOM scan found ${domUrls.length} image URLs`);
+
+        for (const imgUrl of domUrls) {
+          if (done) break;
+          domImageCount++;
+          processImageUrl(imgUrl, 'dom');
+
+          // Early stop if high-priority CDN found from DOM
+          if (cdnFromUrl && matchedUrl && getCDNPriority(cdnFromUrl) >= 8) {
+            done = true;
+            console.log(`[CDN] ✅ ${cdnFromUrl} via DOM Elements scan`);
+            break;
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    // ── Helper: find inner pages (category/product/portfolio) ─────────────────
+    async function findInnerPages(baseUrl, limit = 3) {
+      try {
+        const base = new URL(baseUrl);
+        const links = await page.evaluate((origin) => {
           return Array.from(document.querySelectorAll('a[href]'))
             .map(a => { try { return new URL(a.href, window.location.href).href; } catch { return null; } })
-            .filter(h => h && h.startsWith(baseOrigin) && h !== window.location.href)
-            .filter((v, i, a) => a.indexOf(v) === i) // dedupe
-            .slice(0, 80);
+            .filter(h => h && h.startsWith(origin))
+            .filter((v, i, a) => a.indexOf(v) === i)
+            .slice(0, 100);
         }, base.origin);
 
-        // Score each link by priority pattern
-        let bestLink = null, bestScore = -1;
+        // Score and sort links
+        const scored = [];
         for (const link of links) {
-          const path = new URL(link).pathname;
-          if (SKIP_PATTERNS.test(path)) continue;
+          let path;
+          try { path = new URL(link).pathname; } catch { continue; }
+          if (SKIP_PATHS.test(path)) continue;
           if (path === '/' || path === '') continue;
+          if (path === new URL(baseUrl).pathname) continue; // skip current page
 
           let score = 0;
-          for (let i = 0; i < PRIORITY_PATTERNS.length; i++) {
-            if (PRIORITY_PATTERNS[i].test(path)) { score = PRIORITY_PATTERNS.length - i; break; }
+          for (const { score: s, re } of INNER_PAGE_PRIORITY) {
+            if (re.test(path)) { score = s; break; }
           }
-          // Any inner page beats homepage — give at least score 1
-          if (score === 0 && path.length > 1) score = 1;
-
-          if (score > bestScore) { bestScore = score; bestLink = link; }
+          if (score > 0) scored.push({ url: link, score, path });
         }
-        return bestLink;
-      } catch { return null; }
+
+        scored.sort((a, b) => b.score - a.score);
+
+        // Return top N unique pages, preferring different score levels
+        const seen = new Set();
+        const result = [];
+        for (const item of scored) {
+          if (seen.has(item.url)) continue;
+          seen.add(item.url);
+          result.push(item.url);
+          if (result.length >= limit) break;
+        }
+        return result;
+      } catch { return []; }
     }
 
-    // ── STEP 1: Load homepage first (to get links + initial signals) ──────────
-    let navSuccess = done;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MAIN CRAWL FLOW
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── STEP 1: Load homepage ONLY to collect inner page links ────────────────
+    // We do NOT scan images from the homepage
+    console.log(`[CDN] Step 1: Loading homepage to find inner pages: ${url}`);
+    let homepageLinks = [];
     let lastNavError = null;
-    if (!navSuccess) {
-      try {
-        await navigateTo(url);
-        navSuccess = true;
-        console.log(`[CDN] Loaded homepage: ${url} | images so far: ${imageCount}`);
-      } catch (e) {
-        lastNavError = e;
-        if (imageCount > 0 || serverHeader) navSuccess = true;
-      }
+
+    try {
+      await navigateTo(url);
+      await dismissCookies();
+
+      // Collect inner page links from homepage navigation
+      homepageLinks = await findInnerPages(url, 4);
+      console.log(`[CDN] Found ${homepageLinks.length} inner pages: ${homepageLinks.join(', ')}`);
+
+      // Reset image counters — we don't count homepage images
+      // (Network responses from homepage are captured but we reset the count mindset)
+      const homepageImageCount = networkImageCount;
+      console.log(`[CDN] Homepage loaded ${homepageImageCount} images (not counted in results)`);
+
+    } catch (e) {
+      lastNavError = e;
+      // If homepage itself fails, try to find a direct inner page
+      homepageLinks = [];
     }
 
-    if (!navSuccess) {
-      await page.close().catch(() => {});
-      const errMsg = lastNavError?.message || 'Unknown error';
-      const reason = errMsg.includes('CERT') || errMsg.includes('SSL') || errMsg.includes('certificate')
+    if (homepageLinks.length === 0 && lastNavError) {
+      // Homepage completely failed
+      const errMsg = lastNavError.message || 'Unknown error';
+      const reason = errMsg.includes('CERT') || errMsg.includes('SSL')
         ? `SSL/Certificate error: ${errMsg}`
         : errMsg.includes('timeout') || errMsg.includes('Timeout')
         ? `Page too slow to load (timeout after ${PAGE_TIMEOUT/1000}s)`
-        : errMsg.includes('ERR_NAME_NOT_RESOLVED') || errMsg.includes('DNS')
+        : errMsg.includes('ERR_NAME_NOT_RESOLVED')
         ? `Domain not found (DNS error)`
         : errMsg.includes('ERR_CONNECTION_REFUSED')
         ? `Connection refused — site may be down`
         : `Could not open site: ${errMsg}`;
-      return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', bestImageUrl: null, confidence: 'Low', detail: reason, reason };
+      await page.close().catch(() => {});
+      return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', techStack: '', matchedUrl: '', confidence: 'Low', detail: reason, reason };
     }
 
-    await dismissCookies();
+    // Reset counters — start fresh for inner page scanning
+    networkImageCount = 0;
+    domImageCount = 0;
+    // Keep any CDN/server signals already found from homepage network requests
+    // but reset image count so inner pages are counted separately
 
-    // ── STEP 2: Find and navigate to best inner page ──────────────────────────
-    // Only skip to inner page if we haven't hit min image threshold yet
-    const MIN_IMAGES_BEFORE_INNER = 50; // if homepage gave us <10 images, go deeper
-    let innerPageUrl = null;
+    // ── STEP 2: Scan inner pages (category/product pages) ────────────────────
+    // Both Network tab (auto via response listener) and Elements tab (DOM scan)
+    const pagesToScan = homepageLinks.length > 0
+      ? homepageLinks
+      : [url]; // fallback to homepage if no inner pages found
 
-    if (!done && imageCount < MIN_IMAGES_BEFORE_INNER) {
-      innerPageUrl = await findInnerPageUrl(url);
-      if (innerPageUrl) {
-        console.log(`[CDN] Homepage had ${imageCount} images — navigating to inner page: ${innerPageUrl}`);
-        const imgCountBefore = imageCount;
-        try {
-          await navigateTo(innerPageUrl);
-          console.log(`[CDN] Inner page loaded — ${imageCount - imgCountBefore} new images found`);
-        } catch {
-          console.log(`[CDN] Inner page failed — continuing with homepage data`);
-        }
+    for (let pageIdx = 0; pageIdx < pagesToScan.length; pageIdx++) {
+      if (done) break;
+
+      const targetUrl = pagesToScan[pageIdx];
+      console.log(`[CDN] Step 2.${pageIdx + 1}: Scanning inner page: ${targetUrl}`);
+
+      try {
+        await navigateTo(targetUrl);
         await dismissCookies();
-      }
-    }
 
-    // ── STEP 3: If still not enough images, try one more inner page ───────────
-    if (!done && imageCount < 50 && innerPageUrl) {
-      const secondLink = await findInnerPageUrl(url).then(async (link) => {
-        if (!link || link === innerPageUrl) return null;
-        return link;
-      });
-      if (secondLink && secondLink !== innerPageUrl) {
-        console.log(`[CDN] Still only ${imageCount} images — trying second inner page: ${secondLink}`);
-        try {
-          await navigateTo(secondLink);
-        } catch { /* ignore */ }
-        await dismissCookies();
-      }
-    }
+        // Short wait for lazy images to start loading
+        await new Promise(r => setTimeout(r, AFTER_WAIT));
 
-    // ── STEP 4: Scroll to trigger lazy-loaded images ──────────────────────────
-    if (!done) {
-      await new Promise(r => setTimeout(r, AFTER_WAIT));
-      await humanScroll(SCROLL_PX);
+        // ── ELEMENTS TAB SCAN: extract all image URLs from DOM ────────────────
+        console.log(`[CDN] Running DOM Elements scan on: ${targetUrl}`);
+        await scanDOMElements();
+
+        // ── Scroll to trigger lazy-loaded images (Network tab captures these) ─
+        await humanScroll(SCROLL_PX);
+
+        // Additional wait for any remaining lazy images
+        await new Promise(r => setTimeout(r, 1000));
+
+        console.log(`[CDN] Page ${pageIdx + 1} done — Network: ${networkImageCount} imgs, DOM: ${domImageCount} imgs, CDN: ${cdnFromUrl || 'none yet'}`);
+
+      } catch (e) {
+        console.log(`[CDN] Inner page ${pageIdx + 1} failed: ${e.message}`);
+        continue; // try next inner page
+      }
+
+      // If we found a high-confidence CDN, stop scanning more pages
+      if (done || (cdnFromUrl && getCDNPriority(cdnFromUrl) >= 8 && matchedUrl)) {
+        console.log(`[CDN] High-confidence CDN found — stopping after page ${pageIdx + 1}`);
+        break;
+      }
     }
 
   } catch (err) {
     if (page) await page.close().catch(() => {});
-    return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: `Error: ${err.message}`, reason: `Browser error: ${err.message}` };
+    return {
+      cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available',
+      techStack: '', matchedUrl: '', confidence: 'Low',
+      detail: `Error: ${err.message}`, reason: `Browser error: ${err.message}`,
+    };
   }
 
   await page.close().catch(() => {});
 
-  // ── Score confidence ──────────────────────────────────────────────────────
+  // ── Score and build result ────────────────────────────────────────────────
+  const totalImages = networkImageCount + domImageCount;
+  const finalCDN    = cdnFromUrl || serverCDN || 'Not available';
+  const finalDAM    = damFromUrl || 'Not available';
+  const finalUrl    = matchedUrl || bestImageUrl || '';
+
+  // Tech stack — dedupe and join
+  // Remove CDN names that are already in the CDN column to avoid repetition
+  const cdnNames = new Set([finalCDN, serverCDN, damFromUrl].filter(Boolean).map(s => s.toLowerCase()));
+  const techStackFinal = [...techStackSet]
+    .filter(s => !cdnNames.has(s.toLowerCase()))
+    .join(', ') || '';
+
   let confidence = 'Low';
-  if (cdnFromUrl && serverHeader)      confidence = 'High';
-  else if (cdnFromUrl || serverCDN)    confidence = 'High';
-  else if (damFromUrl)                 confidence = 'Medium';
+  if (cdnFromUrl && serverHeader)   confidence = 'High';
+  else if (cdnFromUrl || serverCDN) confidence = 'High';
+  else if (damFromUrl)              confidence = 'Medium';
 
-  const finalCDN  = cdnFromUrl  || serverCDN || 'Not available';
-  const finalDAM  = damFromUrl  || 'Not available';
-  const detail    = `${imageCount} images scanned${cdnFromUrl ? ' | CDN URL: '+cdnFromUrl : ''}${serverHeader ? ' | Server: '+serverHeader : ''}${damFromUrl ? ' | DAM: '+damFromUrl : ''}`;
-
-  // ── Reason for "Not available" — shown in the Error/Reason column ───────────
   let reason = '';
   if (finalCDN === 'Not available') {
-    if (imageCount === 0) {
-      reason = 'No images loaded — site may have blocked the crawler (bot protection / CAPTCHA)';
-    } else if (imageCount >= MAX_IMAGES) {
-      reason = `Checked ${MAX_IMAGES} images — no Imgix, Cloudinary or known CDN patterns found`;
-    } else {
-      reason = `${imageCount} images scanned — no known CDN or DAM patterns detected in URLs or headers`;
-    }
+    if (totalImages === 0)
+      reason = 'No images loaded on inner pages — site may block crawlers or require login';
+    else if (totalImages >= MAX_IMAGES)
+      reason = `Checked ${MAX_IMAGES} images across inner pages — no known CDN patterns found`;
+    else
+      reason = `${totalImages} images scanned across inner pages — no CDN/DAM patterns detected`;
   }
 
-  // Use matchedUrl if we have one; otherwise fall back to the best real image URL
-  // This fills in URLs for sites where CDN was detected from server headers only
-  const finalUrl = matchedUrl || bestImageUrl || '';
+  const detail = `Network: ${networkImageCount} imgs, DOM: ${domImageCount} imgs${cdnFromUrl ? ' | CDN: '+cdnFromUrl : ''}${serverHeader ? ' | Server: '+serverHeader : ''}${finalDAM !== 'Not available' ? ' | DAM: '+finalDAM : ''}${techStackFinal ? ' | Stack: '+techStackFinal : ''}`;
 
   return {
     cdnFromUrl:  finalCDN,
     server:      serverHeader || serverCDN || '',
     damFromUrl:  finalDAM,
+    techStack:   techStackFinal,
     matchedUrl:  finalUrl,
     confidence,
     detail,
@@ -757,7 +842,7 @@ app.post('/crawl-stream', async (req, res) => {
 
   const send = data => res.write(`data: ${JSON.stringify(data)}\n\n`);
   const { entries } = req.body || {};
-  if (!entries || !entries.length) { send({ type: 'error', message: 'No entries' }); return res.end(); }
+  if (!entries?.length) { send({ type: 'error', message: 'No entries' }); return res.end(); }
 
   let browser;
   try {
@@ -765,10 +850,12 @@ app.post('/crawl-stream', async (req, res) => {
       headless: 'new',
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
       ignoreHTTPSErrors: true,
-      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process','--disable-blink-features=AutomationControlled','--ignore-certificate-errors','--ignore-certificate-errors-spki-list'],
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+             '--disable-gpu','--no-first-run','--no-zygote','--single-process',
+             '--disable-blink-features=AutomationControlled','--ignore-certificate-errors'],
     });
 
-    const queue  = [...entries.map((e, i) => ({ ...e, i }))];
+    const queue = [...entries.map((e, i) => ({ ...e, i }))];
     const active = new Set();
     let done = 0;
 
@@ -789,7 +876,10 @@ app.post('/crawl-stream', async (req, res) => {
             .catch(err => {
               done++;
               active.delete(item.i);
-              send({ type: 'result', index: item.i, company: item.company, website: item.url, cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message, done, total: entries.length });
+              send({ type: 'result', index: item.i, company: item.company, website: item.url,
+                cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', techStack: '',
+                matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message,
+                done, total: entries.length });
               if (queue.length === 0 && active.size === 0) resolve(); else next();
             });
         }
@@ -799,24 +889,14 @@ app.post('/crawl-stream', async (req, res) => {
 
     await browser.close().catch(() => {});
     send({ type: 'done', total: entries.length });
-
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
     send({ type: 'error', message: err.message });
   }
-
   res.end();
 });
 
-app.options('/crawl-stream', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.sendStatus(204);
-});
-
-// ── Single company crawl endpoint — used by frontend polling loop ─────────────
-// Each request is short-lived (~5-15s), no streaming, no timeout issues
+// ── Single crawl endpoint ─────────────────────────────────────────────────────
 app.post('/crawl', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const { url } = req.body || {};
@@ -826,20 +906,22 @@ app.post('/crawl', async (req, res) => {
     headless: 'new',
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
     ignoreHTTPSErrors: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process','--disable-blink-features=AutomationControlled','--ignore-certificate-errors'],
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+           '--disable-gpu','--no-first-run','--no-zygote','--single-process',
+           '--disable-blink-features=AutomationControlled','--ignore-certificate-errors'],
   });
 
   try {
     const result = await crawlSite(browser, url);
     res.json(result);
   } catch (err) {
-    res.json({ cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message });
+    res.json({ cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', techStack: '', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message });
   } finally {
     await browser.close().catch(() => {});
   }
 });
 
-app.options('/crawl', (req, res) => {
+app.options(['/crawl','/crawl-stream'], (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
