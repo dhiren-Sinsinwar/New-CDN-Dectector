@@ -540,6 +540,7 @@ async function run(){
   let cdnCol    = header.findIndex(h=>/identification.*url|imgix.?cloudinary|cdn/i.test(h));
   let serverCol = header.findIndex(h=>/^server$/i.test(h));
   let damCol    = header.findIndex(h=>/^dam$/i.test(h));
+  let techCol   = header.findIndex(h=>/tech.?stack|platform|stack/i.test(h));
   let confCol   = header.findIndex(h=>/confidence/i.test(h));
   let urlCol    = header.findIndex(h=>/^url$/i.test(h));
   let reasonCol = header.findIndex(h=>/error|reason/i.test(h));
@@ -547,10 +548,9 @@ async function run(){
   if(cdnCol===-1)   {cdnCol=newHeader.length;    newHeader.push('Identification from URL');}
   if(serverCol===-1){serverCol=newHeader.length;  newHeader.push('Server');}
   if(damCol===-1)   {damCol=newHeader.length;     newHeader.push('DAM');}
+  if(techCol===-1)  {techCol=newHeader.length;    newHeader.push('Tech Stack');}
   if(confCol===-1)  {confCol=newHeader.length;    newHeader.push('Confidence Score');}
   if(urlCol===-1)   {urlCol=newHeader.length;     newHeader.push('URL');}
-  let techCol  = header.findIndex(h=>/tech.?stack|platform|stack/i.test(h));
-  if(techCol===-1)  {techCol=newHeader.length;   newHeader.push('Tech Stack');}
   if(reasonCol===-1){reasonCol=newHeader.length;  newHeader.push('Error / Reason');}
 
 
