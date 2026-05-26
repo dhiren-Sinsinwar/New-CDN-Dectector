@@ -533,95 +533,174 @@ async function crawlSite(browser, rawUrl) {
       } catch { /* ignore */ }
     });
 
-    // ── Navigate — 4-level fallback chain ────────────────────────────────────
-    let navSuccess = done; // if already done from headers, skip nav errors
-    if (!navSuccess) {
+    // ── Helper: navigate with fallback chain ────────────────────────────────
+    async function navigateTo(targetUrl) {
       const attempts = [
-        // 1st: https with domcontentloaded
-        { url: url, opts: { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT } },
-        // 2nd: https with just a commit (first byte received) — works for slow sites
-        { url: url, opts: { waitUntil: 'commit', timeout: 25000 } },
-        // 3rd: http fallback (some sites redirect https→http)
-        { url: url.replace(/^https:/i, 'http:'), opts: { waitUntil: 'domcontentloaded', timeout: 20000 } },
-        // 4th: http with commit only
-        { url: url.replace(/^https:/i, 'http:'), opts: { waitUntil: 'commit', timeout: 15000 } },
+        { url: targetUrl,                                    opts: { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT } },
+        { url: targetUrl,                                    opts: { waitUntil: 'commit',           timeout: 25000 } },
+        { url: targetUrl.replace(/^https:/i, 'http:'),      opts: { waitUntil: 'domcontentloaded', timeout: 20000 } },
+        { url: targetUrl.replace(/^https:/i, 'http:'),      opts: { waitUntil: 'commit',           timeout: 15000 } },
       ];
-
       let lastError = null;
       for (const attempt of attempts) {
-        if (done) { navSuccess = true; break; } // CDN already found, stop trying
-        try {
-          await page.goto(attempt.url, attempt.opts);
-          navSuccess = true;
-          break;
-        } catch (e) {
+        if (done) return true;
+        try { await page.goto(attempt.url, attempt.opts); return true; }
+        catch (e) {
           lastError = e;
-          // If we already captured some images/signals, that's good enough
-          if (imageCount > 0 || serverHeader || damFromUrl) { navSuccess = true; break; }
+          if (imageCount > 0 || serverHeader || damFromUrl) return true;
         }
       }
-
-      if (!navSuccess) {
-        await page.close().catch(() => {});
-        const errMsg = lastError?.message || 'Unknown navigation error';
-        const reason = errMsg.includes('CERT') || errMsg.includes('SSL') || errMsg.includes('certificate')
-          ? `SSL/Certificate error: ${errMsg}`
-          : errMsg.includes('timeout') || errMsg.includes('Timeout')
-          ? `Page too slow to load (timeout after ${PAGE_TIMEOUT/1000}s)`
-          : errMsg.includes('ERR_NAME_NOT_RESOLVED') || errMsg.includes('DNS')
-          ? `Domain not found (DNS error)`
-          : errMsg.includes('ERR_CONNECTION_REFUSED')
-          ? `Connection refused — site may be down`
-          : `Could not open site: ${errMsg}`;
-        return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', bestImageUrl: null, confidence: 'Low', detail: reason, reason };
-      }
+      throw lastError || new Error('Navigation failed');
     }
 
-    // ── Dismiss cookie banners ────────────────────────────────────────────────
-    if (!done) {
+    // ── Helper: dismiss cookie banners ────────────────────────────────────────
+    async function dismissCookies() {
       try {
-        await page.evaluate((cookieTexts) => {
-          const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-          for (const btn of buttons) {
-            const text = btn.innerText?.toLowerCase().trim() || '';
-            if (cookieTexts.includes(text)) { btn.click(); return; }
+        await page.evaluate((texts) => {
+          const els = document.querySelectorAll('button, a, [role="button"]');
+          for (const el of els) {
+            if (texts.includes(el.innerText?.toLowerCase().trim())) { el.click(); return; }
           }
         }, COOKIE_TEXTS);
         await new Promise(r => setTimeout(r, 500));
       } catch { /* ignore */ }
     }
 
-    // ── Simulate human behaviour: mouse move + scroll ───────────────────────
-    if (!done) {
-      await new Promise(r => setTimeout(r, AFTER_WAIT));
+    // ── Helper: human-like scroll ─────────────────────────────────────────────
+    async function humanScroll(maxPx) {
       try {
-        // Move mouse randomly — bots never move the mouse
-        await page.mouse.move(
-          400 + Math.floor(Math.random() * 400),
-          300 + Math.floor(Math.random() * 200)
-        );
-        await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
-        await page.mouse.move(
-          200 + Math.floor(Math.random() * 600),
-          200 + Math.floor(Math.random() * 400)
-        );
-        await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
-
-        // Scroll with human-like variable speed
-        await page.evaluate(async (maxPx) => {
-          await new Promise(resolve => {
+        await page.mouse.move(400 + Math.random()*400, 300 + Math.random()*200);
+        await new Promise(r => setTimeout(r, 150 + Math.random()*200));
+        await page.evaluate(async (px) => {
+          await new Promise(res => {
             let total = 0;
             const t = setInterval(() => {
-              // Variable scroll distance like a human
-              const step = 200 + Math.floor(Math.random() * 200);
-              window.scrollBy(0, step);
-              total += step;
-              if (total >= maxPx) { clearInterval(t); resolve(); }
-            }, 100 + Math.floor(Math.random() * 80));
+              window.scrollBy(0, 200 + Math.floor(Math.random()*200));
+              total += 300;
+              if (total >= px) { clearInterval(t); res(); }
+            }, 100 + Math.floor(Math.random()*80));
           });
-        }, SCROLL_PX);
-        await new Promise(r => setTimeout(r, 1000));
+        }, maxPx);
+        await new Promise(r => setTimeout(r, 800));
       } catch { /* page may have stopped */ }
+    }
+
+    // ── Helper: find best inner page link from homepage ───────────────────────
+    // Priority: product/category/collection > about/blog > any inner page
+    // Skips: login, cart, checkout, external links
+    async function findInnerPageUrl(baseUrl) {
+      const base = new URL(baseUrl);
+      const PRIORITY_PATTERNS = [
+        // Highest — product/shop/category pages have the most real images
+        /\/(shop|store|products?|collections?|catalogue|catalog|category|categories|range|ranges|buy|purchase)/i,
+        // High — portfolio, gallery, case studies
+        /\/(portfolio|gallery|galleries|work|projects?|case-studies|showcase)/i,
+        // Medium — solutions, services, features
+        /\/(solutions?|services?|features?|platform|offerings?)/i,
+        // Lower — about, team, news
+        /\/(about|team|news|press|media|resources?|insights?|blog)/i,
+      ];
+      const SKIP_PATTERNS = /\/(login|signin|sign-in|signup|sign-up|register|cart|checkout|account|logout|admin|api|cdn|static|assets|wp-admin|wp-json)/i;
+
+      try {
+        const links = await page.evaluate((baseOrigin) => {
+          return Array.from(document.querySelectorAll('a[href]'))
+            .map(a => { try { return new URL(a.href, window.location.href).href; } catch { return null; } })
+            .filter(h => h && h.startsWith(baseOrigin) && h !== window.location.href)
+            .filter((v, i, a) => a.indexOf(v) === i) // dedupe
+            .slice(0, 80);
+        }, base.origin);
+
+        // Score each link by priority pattern
+        let bestLink = null, bestScore = -1;
+        for (const link of links) {
+          const path = new URL(link).pathname;
+          if (SKIP_PATTERNS.test(path)) continue;
+          if (path === '/' || path === '') continue;
+
+          let score = 0;
+          for (let i = 0; i < PRIORITY_PATTERNS.length; i++) {
+            if (PRIORITY_PATTERNS[i].test(path)) { score = PRIORITY_PATTERNS.length - i; break; }
+          }
+          // Any inner page beats homepage — give at least score 1
+          if (score === 0 && path.length > 1) score = 1;
+
+          if (score > bestScore) { bestScore = score; bestLink = link; }
+        }
+        return bestLink;
+      } catch { return null; }
+    }
+
+    // ── STEP 1: Load homepage first (to get links + initial signals) ──────────
+    let navSuccess = done;
+    let lastNavError = null;
+    if (!navSuccess) {
+      try {
+        await navigateTo(url);
+        navSuccess = true;
+        console.log(`[CDN] Loaded homepage: ${url} | images so far: ${imageCount}`);
+      } catch (e) {
+        lastNavError = e;
+        if (imageCount > 0 || serverHeader) navSuccess = true;
+      }
+    }
+
+    if (!navSuccess) {
+      await page.close().catch(() => {});
+      const errMsg = lastNavError?.message || 'Unknown error';
+      const reason = errMsg.includes('CERT') || errMsg.includes('SSL') || errMsg.includes('certificate')
+        ? `SSL/Certificate error: ${errMsg}`
+        : errMsg.includes('timeout') || errMsg.includes('Timeout')
+        ? `Page too slow to load (timeout after ${PAGE_TIMEOUT/1000}s)`
+        : errMsg.includes('ERR_NAME_NOT_RESOLVED') || errMsg.includes('DNS')
+        ? `Domain not found (DNS error)`
+        : errMsg.includes('ERR_CONNECTION_REFUSED')
+        ? `Connection refused — site may be down`
+        : `Could not open site: ${errMsg}`;
+      return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', bestImageUrl: null, confidence: 'Low', detail: reason, reason };
+    }
+
+    await dismissCookies();
+
+    // ── STEP 2: Find and navigate to best inner page ──────────────────────────
+    // Only skip to inner page if we haven't hit min image threshold yet
+    const MIN_IMAGES_BEFORE_INNER = 50; // if homepage gave us <10 images, go deeper
+    let innerPageUrl = null;
+
+    if (!done && imageCount < MIN_IMAGES_BEFORE_INNER) {
+      innerPageUrl = await findInnerPageUrl(url);
+      if (innerPageUrl) {
+        console.log(`[CDN] Homepage had ${imageCount} images — navigating to inner page: ${innerPageUrl}`);
+        const imgCountBefore = imageCount;
+        try {
+          await navigateTo(innerPageUrl);
+          console.log(`[CDN] Inner page loaded — ${imageCount - imgCountBefore} new images found`);
+        } catch {
+          console.log(`[CDN] Inner page failed — continuing with homepage data`);
+        }
+        await dismissCookies();
+      }
+    }
+
+    // ── STEP 3: If still not enough images, try one more inner page ───────────
+    if (!done && imageCount < 50 && innerPageUrl) {
+      const secondLink = await findInnerPageUrl(url).then(async (link) => {
+        if (!link || link === innerPageUrl) return null;
+        return link;
+      });
+      if (secondLink && secondLink !== innerPageUrl) {
+        console.log(`[CDN] Still only ${imageCount} images — trying second inner page: ${secondLink}`);
+        try {
+          await navigateTo(secondLink);
+        } catch { /* ignore */ }
+        await dismissCookies();
+      }
+    }
+
+    // ── STEP 4: Scroll to trigger lazy-loaded images ──────────────────────────
+    if (!done) {
+      await new Promise(r => setTimeout(r, AFTER_WAIT));
+      await humanScroll(SCROLL_PX);
     }
 
   } catch (err) {
