@@ -8,6 +8,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const MAX_IMAGES   = 200;
+const MIN_IMAGES   = 100;  // must scan at least this many before stopping early
 const PARALLEL     = 4;
 const PAGE_TIMEOUT = 20000;
 const AFTER_WAIT   = 1500;
@@ -543,10 +544,10 @@ async function crawlSite(browser, rawUrl) {
           priorityCount++;
           processImageResponse(resUrl, ct, headers);
 
-          // Early stop: high-priority CDN confirmed with a real URL
-          if (cdnFromUrl && matchedUrl && getCDNPriority(cdnFromUrl) >= 8) {
+          // Early stop: high-priority CDN confirmed with a real URL AND min images scanned
+          if (cdnFromUrl && matchedUrl && getCDNPriority(cdnFromUrl) >= 8 && imageCount >= MIN_IMAGES) {
             done = true;
-            console.log(`[CDN] ✅ ${cdnFromUrl} via priority format (image #${imageCount}) — stopping`);
+            console.log(`[CDN] ✅ ${cdnFromUrl} via priority format (image #${imageCount}) — stopping (min ${MIN_IMAGES} reached)`);
             page.evaluate(() => window.stop()).catch(() => {});
           }
         } else {
@@ -659,10 +660,13 @@ async function crawlSite(browser, rawUrl) {
   // Only runs if the priority pass (jpeg/webp/avif) found no CDN signal
   if (!cdnFromUrl && !serverCDN && fallbackQueue.length > 0) {
     console.log(`[CDN] No CDN in ${priorityCount} priority images — checking ${fallbackQueue.length} fallback images (png/gif/etc)`);
+    let fallbackCount = 0;
     for (const { resUrl, ct, headers } of fallbackQueue) {
       processImageResponse(resUrl, ct, headers);
-      if (cdnFromUrl && matchedUrl && getCDNPriority(cdnFromUrl) >= 8) {
-        console.log(`[CDN] ✅ ${cdnFromUrl} found in fallback images — stopping`);
+      fallbackCount++;
+      const totalScanned = priorityCount + fallbackCount;
+      if (cdnFromUrl && matchedUrl && getCDNPriority(cdnFromUrl) >= 8 && totalScanned >= MIN_IMAGES) {
+        console.log(`[CDN] ✅ ${cdnFromUrl} found in fallback images after ${totalScanned} total images — stopping`);
         break;
       }
     }
