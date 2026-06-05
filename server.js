@@ -258,15 +258,22 @@ const IMAGE_TYPES = [
 ];
 function isImgCT(ct = '') { return IMAGE_TYPES.some(t => ct.toLowerCase().includes(t)); }
 
-// ── Image format priority ─────────────────────────────────────────────────────
-// Priority 1: jpeg/webp/avif  — scan these first; stop early if CDN found
-// Priority 2: png + everything else — only used if priority-1 pass found nothing
+// ── Image format / tier priority ──────────────────────────────────────────────
+// Pass 1 (priority): jpeg/webp/avif, non-banner  — scan first; stop early if CDN found
+// Pass 2 (fallback): png/gif/svg/etc, non-banner  — only if pass 1 found nothing
+// Pass 3 (banner):   any banner/hero image        — absolute last resort
 const PRIORITY_FORMATS   = /\.(jpe?g|webp|avif)(\?|$|#)/i;
 const PRIORITY_MIMETYPES = ['image/jpeg','image/jpg','image/webp','image/avif'];
 
 function isPriorityFormat(url = '', ct = '') {
-  return PRIORITY_FORMATS.test(url) ||
-    PRIORITY_MIMETYPES.some(t => ct.toLowerCase().includes(t));
+  return (
+    PRIORITY_FORMATS.test(url) ||
+    PRIORITY_MIMETYPES.some(t => ct.toLowerCase().includes(t))
+  ) && !BANNER_URL_PATTERNS.test(url);  // banners go to pass 3 even if jpeg/webp/avif
+}
+
+function isBannerImage(url = '') {
+  return BANNER_URL_PATTERNS.test(url);
 }
 
 // ── URLs to NEVER save as matched URL ───────────────────────────────────────
@@ -284,10 +291,19 @@ const EXCLUDED_URL_PATTERNS = [
   /blank\.gif/i,
   /pixel\.gif/i,
   /1x1\.gif/i,
-  /\/favicon\.ico/i,
+  /\/favicon\./i,          // any favicon (favicon.ico, favicon.png, favicon-32x32.png, etc.)
+  /favicon-\d/i,           // favicon-32x32, favicon-16x16, etc.
+  /apple-touch-icon/i,     // Apple home screen icons
+  /\/logo\./i,             // /logo.png, /logo.svg, etc.
+  /\/logos?\//i,           // /logo/ or /logos/ directory
+  /\/brand\//i,            // /brand/ directory (often brand assets)
   /cdnjs\.cloudflare\.com/i,
 ];
 function isExcludedUrl(url) { return EXCLUDED_URL_PATTERNS.some(p => p.test(url)); }
+
+// ── URL patterns that indicate a banner / hero image ────────────────────────
+// Banners are valid CDN evidence but deprioritised — processed last
+const BANNER_URL_PATTERNS = /\/(banner|hero|masthead|carousel|slider|splash|header[-_]?img|billboard|jumbotron|cover|bg[-_]?image|background[-_]?image)/i;
 
 // ── CDN priority — specific image CDNs beat generic infrastructure ───────────
 const CDN_PRIORITY = {
@@ -331,10 +347,13 @@ async function crawlSite(browser, rawUrl) {
   let damFromUrl   = null;  // DAM identified from any URL
   let matchedUrl   = null;  // the exact image URL that triggered CDN detection
   let bestImageUrl = null;  // best real image URL seen (fallback when matchedUrl is empty)
+  const keywordCounts = { cloudinary: 0, imgix: 0 };  // DOM keyword search counts
 
-  // Two-pass: collect fallback (png/gif/svg/etc) urls during the live crawl
-  // and only process them if the priority pass (jpeg/webp/avif) found nothing
+  // Three-pass: collect non-priority images during the live crawl.
+  // Pass 2: png/gif/svg/etc (non-banner)
+  // Pass 3: banner/hero images — absolute last resort
   const fallbackQueue = [];  // { resUrl, ct, headers }
+  const bannerQueue   = [];  // { resUrl, ct, headers } — banners only
 
   let page;
 
@@ -477,7 +496,7 @@ async function crawlSite(browser, rawUrl) {
       // Track best real image URL (fallback when matchedUrl is empty)
       if (!isExcludedUrl(resUrl) && resUrl.startsWith('http')) {
         const isLikelyContent = /\.(jpe?g|png|webp|gif|avif)/i.test(resUrl) &&
-          !/favicon|icon|logo|pixel|spacer|blank|1x1|sprite/i.test(resUrl);
+          !/favicon|favicon-\d|apple-touch-icon|icon|logo|logos?\/|pixel|spacer|blank|1x1|sprite/i.test(resUrl);
         if (!bestImageUrl || isLikelyContent) bestImageUrl = resUrl;
       }
 
@@ -538,9 +557,10 @@ async function crawlSite(browser, rawUrl) {
         }
 
         const isPriority = isPriorityFormat(resUrl, ct);
+        const isBanner   = isBannerImage(resUrl);
 
         if (isPriority) {
-          // ── Pass 1: process jpeg/webp/avif immediately ──────────────────────
+          // ── Pass 1: process jpeg/webp/avif (non-banner) immediately ────────
           priorityCount++;
           processImageResponse(resUrl, ct, headers);
 
@@ -550,8 +570,13 @@ async function crawlSite(browser, rawUrl) {
             console.log(`[CDN] ✅ ${cdnFromUrl} via priority format (image #${imageCount}) — stopping (min ${MIN_IMAGES} reached)`);
             page.evaluate(() => window.stop()).catch(() => {});
           }
+        } else if (isBanner) {
+          // ── Pass 3: defer banner/hero images — absolute last resort ─────────
+          if (bannerQueue.length < MAX_IMAGES) {
+            bannerQueue.push({ resUrl, ct, headers });
+          }
         } else {
-          // ── Defer: queue png/gif/svg/etc for pass 2 (only if needed) ────────
+          // ── Pass 2: defer png/gif/svg/etc for fallback processing ───────────
           if (fallbackQueue.length < MAX_IMAGES) {
             fallbackQueue.push({ resUrl, ct, headers });
           }
@@ -651,12 +676,34 @@ async function crawlSite(browser, rawUrl) {
       } catch { /* page may have stopped */ }
     }
 
+    // ── DOM keyword search — counts Cloudinary / Imgix mentions in the page ──
+    // Searches the full rendered DOM (outerHTML) — equivalent to Inspect Element
+    // → Elements tab, then Ctrl+F for the keyword.
+    try {
+      const kwCounts = await page.evaluate(() => {
+        const html = document.documentElement.outerHTML.toLowerCase();
+        // Count all non-overlapping occurrences
+        const countOf = (kw) => {
+          let n = 0, pos = 0;
+          while ((pos = html.indexOf(kw, pos)) !== -1) { n++; pos += kw.length; }
+          return n;
+        };
+        return {
+          cloudinary: countOf('cloudinary'),
+          imgix:      countOf('imgix'),
+        };
+      });
+      keywordCounts.cloudinary = kwCounts.cloudinary;
+      keywordCounts.imgix      = kwCounts.imgix;
+      console.log(`[KW] Cloudinary:${kwCounts.cloudinary} Imgix:${kwCounts.imgix}`);
+    } catch { /* page may have been navigated away */ }
+
   } catch (err) {
     if (page) await page.close().catch(() => {});
-    return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: `Error: ${err.message}`, reason: `Browser error: ${err.message}` };
+    return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: `Error: ${err.message}`, reason: `Browser error: ${err.message}`, keywordCounts: { cloudinary: 0, imgix: 0 } };
   }
 
-  // ── Pass 2: process fallback images (png/gif/svg/etc) ────────────────────────
+  // ── Pass 2: process fallback images (png/gif/svg/etc, non-banner) ───────────
   // Only runs if the priority pass (jpeg/webp/avif) found no CDN signal
   if (!cdnFromUrl && !serverCDN && fallbackQueue.length > 0) {
     console.log(`[CDN] No CDN in ${priorityCount} priority images — checking ${fallbackQueue.length} fallback images (png/gif/etc)`);
@@ -672,6 +719,21 @@ async function crawlSite(browser, rawUrl) {
     }
   }
 
+  // ── Pass 3: process banner/hero images — only if passes 1 & 2 found nothing ─
+  if (!cdnFromUrl && !serverCDN && bannerQueue.length > 0) {
+    console.log(`[CDN] No CDN in passes 1+2 — checking ${bannerQueue.length} banner/hero images as last resort`);
+    let bannerCount = 0;
+    for (const { resUrl, ct, headers } of bannerQueue) {
+      processImageResponse(resUrl, ct, headers);
+      bannerCount++;
+      const totalScanned = priorityCount + bannerCount;
+      if (cdnFromUrl && matchedUrl && getCDNPriority(cdnFromUrl) >= 8 && totalScanned >= MIN_IMAGES) {
+        console.log(`[CDN] ✅ ${cdnFromUrl} found in banner images after ${totalScanned} total images — stopping`);
+        break;
+      }
+    }
+  }
+
   await page.close().catch(() => {});
 
   // ── Score confidence ──────────────────────────────────────────────────────
@@ -682,7 +744,7 @@ async function crawlSite(browser, rawUrl) {
 
   const finalCDN  = cdnFromUrl  || serverCDN || 'Not available';
   const finalDAM  = damFromUrl  || 'Not available';
-  const detail = `${imageCount} images scanned (${priorityCount} priority: jpeg/webp/avif, ${fallbackQueue.length} fallback: png/other)${cdnFromUrl ? ' | CDN URL: '+cdnFromUrl : ''}${serverHeader ? ' | Server: '+serverHeader : ''}${damFromUrl ? ' | DAM: '+damFromUrl : ''}`;
+  const detail = `${imageCount} images scanned (${priorityCount} priority: jpeg/webp/avif, ${fallbackQueue.length} fallback: png/other, ${bannerQueue.length} banners: last resort)${cdnFromUrl ? ' | CDN URL: '+cdnFromUrl : ''}${serverHeader ? ' | Server: '+serverHeader : ''}${damFromUrl ? ' | DAM: '+damFromUrl : ''}`;
 
   // ── Reason for "Not available" — shown in the Error/Reason column ───────────
   let reason = '';
@@ -708,6 +770,7 @@ async function crawlSite(browser, rawUrl) {
     confidence,
     detail,
     reason,
+    keywordCounts,
   };
 }
 
@@ -753,7 +816,7 @@ app.post('/crawl-stream', async (req, res) => {
             .catch(err => {
               done++;
               active.delete(item.i);
-              send({ type: 'result', index: item.i, company: item.company, website: item.url, cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message, done, total: entries.length });
+              send({ type: 'result', index: item.i, company: item.company, website: item.url, cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message, keywordCounts: { cloudinary: 0, imgix: 0 }, done, total: entries.length });
               if (queue.length === 0 && active.size === 0) resolve(); else next();
             });
         }
@@ -797,7 +860,7 @@ app.post('/crawl', async (req, res) => {
     const result = await crawlSite(browser, url);
     res.json(result);
   } catch (err) {
-    res.json({ cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message });
+    res.json({ cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: err.message, reason: err.message, keywordCounts: { cloudinary: 0, imgix: 0 } });
   } finally {
     await browser.close().catch(() => {});
   }
