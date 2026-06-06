@@ -240,6 +240,55 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 let results=[], running=false, oauthToken=null, tokenClient=null, clientIdReady=false;
+let tokenExpiresAt=0; // epoch ms when current token expires
+
+// ── Silent token refresh ──────────────────────────────────────────────────────
+// Google tokens expire after 3600s. This returns a valid token, refreshing
+// silently (no popup) if the current one has less than 5 minutes left.
+// Works indefinitely as long as the browser's Google session is active.
+let tokenRefreshPromise = null; // prevents concurrent refresh races
+
+function getValidToken(){
+  const fiveMin = 5 * 60 * 1000;
+  if(oauthToken && Date.now() < tokenExpiresAt - fiveMin){
+    return Promise.resolve(oauthToken); // still fresh, return immediately
+  }
+  // If a refresh is already in flight, reuse it (avoid parallel refresh races)
+  if(tokenRefreshPromise) return tokenRefreshPromise;
+  if(!tokenClient || !clientIdReady){
+    return Promise.reject(new Error('Not signed in to Google'));
+  }
+
+  tokenRefreshPromise = new Promise((resolve, reject) => {
+    // Temporarily swap the callback to capture the refreshed token
+    const savedInit = tokenClient;
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: localStorage.getItem('gClientId'),
+      scope: 'https://www.googleapis.com/auth/spreadsheets',
+      callback: (resp) => {
+        tokenRefreshPromise = null;
+        if(resp.error){
+          // Silent refresh failed — likely session expired; ask user to re-auth
+          oauthToken = null;
+          setStatus('Google session expired — please sign in again', 'error');
+          document.getElementById('gSignInBtn').className='primary google';
+          document.getElementById('gSignInBtn').innerHTML='<svg width="16" height="16" viewBox="0 0 48 48" style="flex-shrink:0"><path fill="#4285f4" d="M44.5 20H24v8.5h11.8C34.7 33.9 29.9 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21c10.5 0 20-7.6 20-21 0-1.4-.1-2.7-.5-4z"/></svg> Re-connect Google';
+          reject(new Error('Session expired: ' + resp.error));
+          return;
+        }
+        oauthToken = resp.access_token;
+        tokenExpiresAt = Date.now() + (resp.expires_in || 3600) * 1000;
+        log('Token refreshed silently ✓', 'info');
+        resolve(oauthToken);
+      }
+    });
+    clientIdReady = true;
+    // prompt:'' = silent refresh, no popup if Google session still active
+    tokenClient.requestAccessToken({prompt:''});
+  });
+
+  return tokenRefreshPromise;
+}
 let timerStart=null, timerInterval=null;
 
 window.addEventListener('load', () => {
@@ -325,6 +374,7 @@ function initTokenClient(clientId){
       callback:(resp)=>{
         if(resp.error){setStatus('Google auth error: '+resp.error,'error');return;}
         oauthToken=resp.access_token;
+        tokenExpiresAt=Date.now()+(resp.expires_in||3600)*1000;
         const btn=document.getElementById('gSignInBtn');
         btn.className='primary google signed';
         btn.innerHTML='<svg width="16" height="16" viewBox="0 0 48 48" style="flex-shrink:0"><path fill="#fff" d="M44.5 20H24v8.5h11.8C34.7 33.9 29.9 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21c10.5 0 20-7.6 20-21 0-1.4-.1-2.7-.5-4z"/></svg> Signed in ✓';
@@ -369,10 +419,10 @@ async function fetchSheetData(sheetId, gid){
   return(await r.json()).values||[];
 }
 async function writeToSheet(sheetId,updates){
-  if(!oauthToken)throw new Error('Not signed in to Google');
+  const token = await getValidToken();
   const r=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`,{
     method:'POST',
-    headers:{'Authorization':'Bearer '+oauthToken,'Content-Type':'application/json'},
+    headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},
     body:JSON.stringify({valueInputOption:'RAW',data:updates})
   });
   if(!r.ok){const e=await r.json();throw new Error(e.error?.message||'Write failed');}
@@ -381,7 +431,7 @@ async function writeToSheet(sheetId,updates){
 // ── Per-company polling — one short request per company, no long connections ──
 // Each /crawl request takes ~5-15s. Frontend loops through all companies itself.
 // No SSE, no batches, no Railway timeout issues. Works for any number of companies.
-const CONCURRENCY = 4; // 4 parallel crawls at a time
+const CONCURRENCY = 3; // must match server PARALLEL — 3 companies at once
 
 async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
   const base = serverUrl.replace(/\/$/, '');
@@ -617,19 +667,18 @@ async function run(){
         { range: `${activeSheetName}!${colLetter(richestPageCol)}${entry.row}`,   values: [[richestPage]]   },
         { range: `${activeSheetName}!${colLetter(pagesScannedCol)}${entry.row}`,  values: [[pagesScanned]]  }
       );
-      // Write to sheet immediately every 5 results — don't wait until end
-      if(oauthToken && sheetUpdates.length % 45 === 0){
-        const batch = sheetUpdates.slice(-45);
-        writeToSheet(sheetId, batch).catch(e => log('Auto-save failed: '+e.message,'err'));
+      // Write this company to sheet immediately — don't batch, don't lose data
+      if(oauthToken){
+        const batch = sheetUpdates.slice(-9); // always the last 9 entries = this company
+        writeToSheet(sheetId, batch).catch(e => log('Sheet write failed: '+e.message,'err'));
       }
     }
   );
 
-  // Final flush — write any remaining results not yet saved
+  // Final flush — re-write everything as a safety net in case any individual writes failed
   if(oauthToken && sheetUpdates.length > 0){
     try{
       setStatus('Final save to Google Sheet…','running');
-      // Final full write — sends everything in batches of 60 (10 companies × 6 cols)
       for(let i=0;i<sheetUpdates.length;i+=90){
         await writeToSheet(sheetId, sheetUpdates.slice(i, i+90));
       }
