@@ -9,7 +9,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ── Config ────────────────────────────────────────────────────────────────────
 const MAX_IMAGES   = 200;
 const MIN_IMAGES   = 100;  // must scan at least this many before stopping early
-const PARALLEL     = 2;    // keep low — discovery opens up to 21 pages per company
+const PARALLEL     = 3;    // 3 parallel companies; discovery opens ~8 pages each = ~24 tabs max
 const PAGE_TIMEOUT = 20000;
 const AFTER_WAIT   = 1500;
 const SCROLL_PX    = 4000;
@@ -328,9 +328,9 @@ const COOKIE_TEXTS = [
 ];
 
 // ── Page discovery config ─────────────────────────────────────────────────────
-const MAX_DISCOVER_PAGES = 20;   // max internal pages to probe in discovery phase
-const DISCOVER_TIMEOUT   = 12000; // timeout per discovery page
-const DISCOVER_WAIT      = 800;   // ms to wait after load before counting images
+const MAX_DISCOVER_PAGES = 8;    // max internal pages to probe in discovery phase
+const DISCOVER_TIMEOUT   = 8000; // timeout per discovery page
+const DISCOVER_WAIT      = 500;  // ms to wait after load before counting images
 
 // ── Discover internal links from a page ───────────────────────────────────────
 // Returns same-origin hrefs found in <a> tags, deduplicated, excluding
@@ -448,8 +448,16 @@ async function discoverRichestPage(browser, homeUrl, pageSetup) {
   results.push({ url: homeUrl, imageCount: homeImageCount });
 
   // Step 2: Probe up to MAX_DISCOVER_PAGES - 1 internal pages (skip if home already failed)
+  // Hard cap: entire discovery phase must finish within 45s total (prevents geo-slow sites)
+  const DISCOVERY_TOTAL_TIMEOUT = 45000;
+  const discoveryStart = Date.now();
+
   const toProbe = internalLinks.slice(0, MAX_DISCOVER_PAGES - 1);
   for (const link of toProbe) {
+    if (Date.now() - discoveryStart > DISCOVERY_TOTAL_TIMEOUT) {
+      console.log(`[DISCOVER] Total discovery timeout reached after ${((Date.now()-discoveryStart)/1000).toFixed(1)}s — using best page found so far`);
+      break;
+    }
     const count = await probePage(link);
     results.push({ url: link, imageCount: count });
   }
