@@ -1,0 +1,25 @@
+# Fly.io configuration for CDN Detector
+# Deploy with: fly deploy
+
+app = "cdn-detector"
+primary_region = "sin"  # Singapore — closest to Bengaluru, change if needed
+# Other options: bom (Mumbai), lhr (London), fra (Frankfurt), iad (US East)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = true   # Stop when idle to save cost
+  auto_start_machines = true  # Auto-start on incoming request
+  min_machines_running = 0    # Scale to zero when not in use
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 10
+    soft_limit = 5
+
+[[vm]]
+  size = "shared-cpu-1x"  # Cheapest option
+  memory = "1gb"          # 1GB RAM — enough for Puppeteer with PARALLEL=2
