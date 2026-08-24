@@ -9,7 +9,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ── Config ────────────────────────────────────────────────────────────────────
 const MAX_IMAGES   = 200;
 const MIN_IMAGES   = 100;  // must scan at least this many before stopping early
-const PARALLEL     = 3;    // 3 parallel companies; discovery opens ~8 pages each = ~24 tabs max
+const PARALLEL     = 2;    // 2 parallel companies on Fly.io 1GB RAM (Chrome ~300MB each)
 const PAGE_TIMEOUT = 20000;
 const AFTER_WAIT   = 1500;
 const SCROLL_PX    = 4000;
