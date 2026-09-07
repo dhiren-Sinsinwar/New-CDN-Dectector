@@ -1,20 +1,23 @@
-# Puppeteer + Chrome on Fly.io
+# Uses the official Puppeteer Docker image — Chrome + all libs pre-installed
 FROM ghcr.io/puppeteer/puppeteer:22.8.2
 
-# Run as root
+# Run as root to avoid permission issues on Railway
 USER root
 
 WORKDIR /app
 
+# Copy package files
 COPY package.json ./
+
+# Install dependencies
 RUN npm install
 
+# Copy server and frontend
 COPY server.js ./
 COPY public/ ./public/
 
-# Fly.io uses PORT env var (default 8080, but we set 3000)
+# Railway assigns PORT dynamically
 ENV PORT=3000
 EXPOSE 3000
 
-# Limit Node.js memory to reduce costs on Fly.io
-CMD ["node", "--max-old-space-size=512", "server.js"]
+CMD ["node", "server.js"]
