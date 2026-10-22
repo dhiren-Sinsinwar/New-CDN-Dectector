@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>CDN Detector — Imgix & Cloudinary</title>
+<title>CDN Detector</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
@@ -47,6 +47,10 @@ button.primary:disabled{background:#aaa;cursor:not-allowed}
 button.primary.google{background:#4285f4}
 button.primary.google:hover{background:#357ae8}
 button.primary.signed{background:#1a7a3a}
+button.primary.stop{background:#7f1d1d}
+button.primary.stop:hover{background:#991b1b}
+button.primary.restart{background:#1e3a5f}
+button.primary.restart:hover{background:#1e40af}
 .setup-box{background:#f7f7f5;border-radius:10px;padding:14px 16px;font-size:12px;color:#555;line-height:1.85;margin-top:12px;border:1px solid #eee}
 .setup-box strong{color:#222}
 .setup-box a{color:#3b82f6;text-decoration:none}
@@ -115,13 +119,13 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
 <div class="wrap">
 
   <p class="eyebrow">Image CDN Intelligence</p>
-  <h1>CDN Detector<br><em>Imgix &amp; Cloudinary</em></h1>
-  <p class="subtitle">Opens each website in a real headless browser, intercepts every network request (just like DevTools → Network tab), finds image URLs and HTTP headers, then detects Imgix or Cloudinary.</p>
+  <h1><em>CDN Detector</em></h1>
+  <p class="subtitle">Opens each website in a real headless browser, intercepts every network request (just like DevTools → Network tab), scans image URLs and HTTP headers to detect any image CDN or DAM platform.</p>
 
   <div class="how">
     <span class="step">1</span><strong>Headless Chrome opens the site</strong> — runs all JS, loads all images →
     <span class="step">2</span><strong>Every network request intercepted</strong> — same as DevTools Network tab →
-    <span class="step">3</span><strong>Image URLs + headers scanned</strong> for imgix.net / cloudinary.com →
+    <span class="step">3</span><strong>Image URLs + headers scanned</strong> for any CDN or DAM platform →
     <span class="step">4</span><strong>Results written</strong> to your Google Sheet
   </div>
 
@@ -129,24 +133,9 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
   <div class="white-card">
     <div class="card-label">Step 1 — Browser Server URL</div>
     <div class="field">
-      <div class="field-label">Puppeteer server URL <span style="color:#bbb;font-size:11px">(your headless browser backend)</span></div>
-      <input type="text" id="serverUrl" placeholder="https://your-app.railway.app" />
-      <p class="hint">
-        Deploy <strong>server.js</strong> to Railway (free tier). <a href="javascript:void(0)" onclick="toggleServerHelp()">Show deployment guide ▾</a>
-      </p>
-      <div id="serverHelp" class="setup-box" style="display:none">
-        <strong>Deploy to Railway (free, ~3 min):</strong>
-        <ol>
-          <li>Go to <a href="https://railway.app" target="_blank">railway.app</a> → sign up free with GitHub</li>
-          <li>Click <strong>New Project → Deploy from GitHub repo</strong></li>
-          <li>Push these files to a GitHub repo: <code>server.js</code>, <code>package.json</code>, <code>nixpacks.toml</code></li>
-          <li>Railway auto-detects Node.js and deploys automatically</li>
-          <li>Go to your project → <strong>Settings → Networking → Generate Domain</strong></li>
-          <li>Copy the URL (e.g. <code>https://cdn-detector.up.railway.app</code>)</li>
-          <li>Paste it in the field above</li>
-        </ol>
-        <p style="margin-top:8px;color:#888">Railway free tier: 500 hours/month — plenty for scanning thousands of companies.</p>
-      </div>
+      <div class="field-label">Browser server URL</div>
+      <input type="text" id="serverUrl" placeholder="Auto-detected from current page…" />
+      <p class="hint">Auto-detected from where this app is hosted. Override only if your backend is on a different URL.</p>
     </div>
   </div>
 
@@ -186,8 +175,10 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
     <div class="row">
       <input type="text" id="sheetUrl" placeholder="https://docs.google.com/spreadsheets/d/…" />
       <button class="primary" id="runBtn" onclick="run()">Run detector ↗</button>
+      <button class="primary" id="stopBtn" onclick="stopScan()" style="background:#7f1d1d;display:none">⏹ Stop</button>
+      <button class="primary" id="restartBtn" onclick="restartScan()" style="background:#1e3a5f;display:none">↺ Restart</button>
     </div>
-    <p class="hint">Sheet needs <strong>Company</strong> and <strong>Website</strong> columns. <strong>Imgix/Cloudinary</strong> and <strong>Confidence Score</strong> columns will be added automatically.</p>
+    <p class="hint">Sheet needs <strong>Company</strong> and <strong>Website</strong> columns. CDN detection columns will be added automatically.</p>
   </div>
 
   <!-- Status -->
@@ -241,12 +232,44 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
 <script>
 let results=[], running=false, oauthToken=null, tokenClient=null, clientIdReady=false;
 let timerStart=null, timerInterval=null;
+let stopRequested=false;
+
+function stopScan(){
+  stopRequested=true;
+  running=false;
+  setStatus('Scan stopped by user','error');
+  stopTimer();
+  document.getElementById('stopBtn').style.display='none';
+  document.getElementById('restartBtn').style.display='inline-flex';
+  document.getElementById('runBtn').style.display='none';
+}
+
+function restartScan(){
+  stopRequested=false;
+  results=[];
+  document.getElementById('tableBody').innerHTML='';
+  document.getElementById('logBox').innerHTML='';
+  document.getElementById('restartBtn').style.display='none';
+  document.getElementById('runBtn').style.display='inline-flex';
+  document.getElementById('runBtn').disabled=false;
+  document.getElementById('progressWrap').style.display='none';
+  document.getElementById('resultsSection').style.display='none';
+  document.getElementById('timerBar').style.display='none';
+  setStatus('Ready — paste a sheet URL and click Run','');
+  document.getElementById('sumTotal').textContent='0';
+  document.getElementById('sumCDN').textContent='0';
+  document.getElementById('sumDAM').textContent='0';
+  document.getElementById('sumServer').textContent='0';
+  document.getElementById('sumNA').textContent='0';
+}
 
 window.addEventListener('load', () => {
   const saved=localStorage.getItem('gClientId')||'';
   if (saved){document.getElementById('oauthClientId').value=saved;initTokenClient(saved);}
+  // Auto-populate server URL from current page origin (app and backend are same server)
   const savedServer=localStorage.getItem('serverUrl')||'';
-  if (savedServer) document.getElementById('serverUrl').value=savedServer;
+  const autoUrl = window.location.origin;
+  document.getElementById('serverUrl').value = savedServer || autoUrl;
 });
 
 function toggleVis(id,btn){const el=document.getElementById(id);el.type=el.type==='password'?'text':'password';btn.textContent=el.type==='password'?'show':'hide';}
@@ -378,57 +401,122 @@ async function writeToSheet(sheetId,updates){
   if(!r.ok){const e=await r.json();throw new Error(e.error?.message||'Write failed');}
 }
 
-// ── Per-company polling — one short request per company, no long connections ──
-// Each /crawl request takes ~5-15s. Frontend loops through all companies itself.
-// No SSE, no batches, no Railway timeout issues. Works for any number of companies.
-const CONCURRENCY = 4; // 4 parallel crawls at a time
+// ── Per-company polling with auto-restart on timeout ─────────────────────────
+const CONCURRENCY = 8; // parallel crawls
+const MAX_RETRIES_PER_COMPANY = 3;
+const COMPANY_TIMEOUT_MS = 60000; // 60s per company before auto-retry
+const RETRY_DELAY_MS = 3000;      // wait 3s between retries
+
+// Track which companies are done so auto-restart skips them
+const completedIndices = new Set();
+let autoRestartCount = 0;
+const MAX_AUTO_RESTARTS = 5;
 
 async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
   const base = serverUrl.replace(/\/$/, '');
-  const queue = [...allEntries];
-  let done = 0;
 
-  // Run CONCURRENCY workers in parallel, each pulling from the queue
-  async function worker() {
-    while (queue.length > 0) {
-      const entry = queue.shift();
-      if (!entry) return;
+  // Only process entries not yet completed
+  const remaining = () => allEntries.filter(e => !completedIndices.has(e.index) && !stopRequested);
 
-      onProgress({ index: entry.index, company: entry.company, website: entry.url });
+  async function runBatch(entries) {
+    const queue = [...entries];
+    let done = 0;
 
-      let result;
-      let retries = 0;
-      while (retries <= 2) {
-        try {
-          const r = await fetch(base + '/crawl', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: entry.url }),
-            signal: AbortSignal.timeout(45000) // 45s per company max
-          });
-          if (!r.ok) throw new Error(`Server ${r.status}`);
-          result = await r.json();
-          break;
-        } catch (err) {
-          retries++;
-          if (retries > 2) {
-            result = { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', matchedUrl: '', confidence: 'Low', detail: 'Failed: ' + err.message };
-          } else {
-            await new Promise(r => setTimeout(r, 2000 * retries));
+    async function worker() {
+      while (queue.length > 0 && !stopRequested) {
+        const entry = queue.shift();
+        if (!entry) return;
+
+        onProgress({ index: entry.index, company: entry.company, website: entry.url });
+
+        let result;
+        let retries = 0;
+        while (retries <= MAX_RETRIES_PER_COMPANY) {
+          try {
+            const r = await fetch(base + '/crawl', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: entry.url }),
+              signal: AbortSignal.timeout(COMPANY_TIMEOUT_MS)
+            });
+            if (!r.ok) throw new Error(`Server ${r.status}`);
+            result = await r.json();
+            break;
+          } catch (err) {
+            retries++;
+            const isTimeout = err.name === 'TimeoutError' || err.message.includes('timeout') || err.message.includes('Timeout');
+            if (retries > MAX_RETRIES_PER_COMPANY) {
+              const reason = isTimeout
+                ? `Timed out after ${COMPANY_TIMEOUT_MS/1000}s (${MAX_RETRIES_PER_COMPANY} retries)`
+                : `Failed after ${MAX_RETRIES_PER_COMPANY} retries: ${err.message}`;
+              result = { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', techStack: '', matchedUrl: '', confidence: 'Low', detail: reason, reason };
+            } else {
+              const waitMs = RETRY_DELAY_MS * retries;
+              log(`${entry.company}: ${isTimeout ? 'timeout' : 'error'} — retry ${retries}/${MAX_RETRIES_PER_COMPANY} in ${waitMs/1000}s`, 'err');
+              await new Promise(r => setTimeout(r, waitMs));
+            }
           }
         }
-      }
 
-      done++;
-      onResult({ index: entry.index, company: entry.company, website: entry.url, ...result, done, total: allEntries.length });
+        completedIndices.add(entry.index);
+        onResult({ index: entry.index, company: entry.company, website: entry.url, ...result, done: completedIndices.size, total: allEntries.length });
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, entries.length) }, () => worker()));
   }
 
-  // Launch CONCURRENCY workers simultaneously
-  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+  // ── Auto-restart loop — resumes after server timeout/crash ───────────────
+  while (remaining().length > 0 && !stopRequested) {
+    const toProcess = remaining();
+    if (toProcess.length === 0) break;
+
+    try {
+      // Health check before starting
+      const health = await fetch(base + '/health', { signal: AbortSignal.timeout(10000) }).catch(() => null);
+      if (!health || !health.ok) throw new Error('Server not responding');
+      await runBatch(toProcess);
+      break; // all done
+
+    } catch (err) {
+      if (stopRequested) break;
+      autoRestartCount++;
+      const stillLeft = remaining().length;
+
+      if (autoRestartCount > MAX_AUTO_RESTARTS) {
+        log(`Auto-restart limit reached — ${stillLeft} companies skipped`, 'err');
+        setStatus(`Stopped after ${MAX_AUTO_RESTARTS} restarts — ${completedIndices.size} done`, 'error');
+        break;
+      }
+
+      const waitSec = autoRestartCount * 5;
+      log(`Server timeout — auto-restarting in ${waitSec}s (${stillLeft} left, restart ${autoRestartCount}/${MAX_AUTO_RESTARTS})`, 'err');
+      setStatus(`Server timeout — restarting in ${waitSec}s… (${stillLeft} left)`, 'running');
+      await new Promise(r => setTimeout(r, waitSec * 1000));
+
+      // Wait for server to recover
+      let serverBack = false;
+      for (let i = 0; i < 12; i++) {
+        try {
+          const h = await fetch(base + '/health', { signal: AbortSignal.timeout(5000) });
+          if (h.ok) { serverBack = true; break; }
+        } catch { /* still down */ }
+        await new Promise(r => setTimeout(r, 5000));
+        log(`Waiting for server… (${(i+1)*5}s elapsed)`, 'info');
+      }
+
+      if (!serverBack) {
+        log('Server did not recover after 60s — stopping', 'err');
+        setStatus(`Server unreachable — ${completedIndices.size} done, ${remaining().length} skipped`, 'error');
+        break;
+      }
+
+      log(`Server is back — resuming ${remaining().length} remaining`, 'ok');
+      setStatus(`Resumed after restart — ${remaining().length} left`, 'running');
+    }
+  }
 }
 
-// ── Table ─// ── Table ─────────────────────────────────────────────────────────────────────
+// ── Table ─────────────────────────────────────────────────────────────────────
 function cdnBadge(cdn){
   if(!cdn||cdn==='…')return '<span class="badge b-pending">—</span>';
   const l=cdn.toLowerCase();
@@ -506,8 +594,11 @@ async function run(){
   if(!oauthToken){const go=confirm('Not signed in to Google — results won\'t write to sheet.\n\nContinue? (CSV export still works)');if(!go)return;}
 
   localStorage.setItem('serverUrl',serverUrl);
-  running=true;results=[];
+  running=true;results=[];stopRequested=false;
   startTimer();
+  document.getElementById('runBtn').disabled=true;
+  document.getElementById('stopBtn').style.display='inline-flex';
+  document.getElementById('restartBtn').style.display='none';
   document.getElementById('runBtn').disabled=true;
   document.getElementById('tableBody').innerHTML='';
   document.getElementById('logBox').innerHTML='';
@@ -530,7 +621,10 @@ async function run(){
     log(`Loaded ${rows.length-1} rows`,'ok');
   }catch(err){
     setStatus('Error: '+err.message,'error');log(err.message,'err');
-    running=false;document.getElementById('runBtn').disabled=false;return;
+    running=false;
+  document.getElementById('runBtn').disabled=false;
+  document.getElementById('stopBtn').style.display='none';
+  document.getElementById('restartBtn').style.display='inline-flex';return;
   }
 
   const entries=rows.slice(1).filter(r=>r[websiteIdx]).map((r,i)=>({row:i+2,company:r[companyIdx]||'',website:r[websiteIdx]||''}));
@@ -570,6 +664,7 @@ async function run(){
     entries.map((e, i) => ({ company: e.company, url: e.website, index: i })),
     // onProgress
     (ev) => {
+      if(stopRequested) return;
       setStatus(`Scanning ${ev.company}…`, 'running', `${ev.done||0} / ${entries.length}`);
       updateRow(ev.index, ev.company, entries[ev.index].website, '…', '', '', '', '—', '', '');
     },
@@ -628,7 +723,10 @@ async function run(){
     stopTimer();
     setStatus(`Complete — ${results.filter(Boolean).length} sites scanned. Use CSV export.`,'ok');
   }
-  running=false;document.getElementById('runBtn').disabled=false;
+  running=false;
+  document.getElementById('runBtn').disabled=false;
+  document.getElementById('stopBtn').style.display='none';
+  document.getElementById('restartBtn').style.display='inline-flex';
 }
 
 function exportCSV(){
