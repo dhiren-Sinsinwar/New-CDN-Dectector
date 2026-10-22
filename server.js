@@ -7,11 +7,11 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const MAX_IMAGES   = 200;   // max images to check per page
-const PARALLEL     = 4;     // concurrent crawls
-const PAGE_TIMEOUT = 20000; // 20s per page load
-const AFTER_WAIT   = 1500;  // wait after load for lazy images
-const SCROLL_PX    = 5000;  // scroll depth
+const MAX_IMAGES   = 100;   // max images to check per page (reduced for speed)
+const PARALLEL     = 8;     // concurrent crawls (increased for speed)
+const PAGE_TIMEOUT = 15000; // 15s per page load (reduced)
+const AFTER_WAIT   = 800;   // wait after load for lazy images (reduced)
+const SCROLL_PX    = 2500;  // scroll depth (reduced — CDN signals in first screenful)
 
 // ── CDN URL patterns ──────────────────────────────────────────────────────────
 const CDN_URL_PATTERNS = [
@@ -689,33 +689,69 @@ async function crawlSite(browser, rawUrl) {
     // MAIN CRAWL FLOW
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // ── STEP 1: Load homepage ONLY to collect inner page links ────────────────
-    // We do NOT scan images from the homepage
-    console.log(`[CDN] Step 1: Loading homepage to find inner pages: ${url}`);
-    let homepageLinks = [];
+    // ── STEP 1: Build candidate inner page URLs ──────────────────────────────
+    // Strategy: guess common paths directly (saves 5-8s vs loading homepage first)
+    // Falls back to homepage link-scraping only if guessed paths fail
+    const baseUrl = new URL(url);
+    const origin  = baseUrl.origin;
+
+    // Common inner page paths ordered by image richness
+    const GUESSED_PATHS = [
+      '/products', '/shop', '/store', '/collections', '/category',
+      '/categories', '/catalogue', '/catalog', '/range', '/ranges',
+      '/portfolio', '/gallery', '/work', '/case-studies',
+      '/solutions', '/services', '/features', '/platform',
+      '/about', '/team', '/blog', '/news',
+    ];
+
+    // Build candidate URLs from guessed paths + homepage fallback
+    const candidateUrls = [
+      ...GUESSED_PATHS.map(p => origin + p),
+      url, // homepage as last resort
+    ];
+
+    // ── STEP 2: Try candidates until we get a working inner page ─────────────
     let lastNavError = null;
+    let pagesScanned = 0;
+    const MAX_PAGES  = 3; // scan up to 3 inner pages
 
-    try {
-      await navigateTo(url);
-      await dismissCookies();
-
-      // Collect inner page links from homepage navigation
-      homepageLinks = await findInnerPages(url, 4);
-      console.log(`[CDN] Found ${homepageLinks.length} inner pages: ${homepageLinks.join(', ')}`);
-
-      // Reset image counters — we don't count homepage images
-      // (Network responses from homepage are captured but we reset the count mindset)
-      const homepageImageCount = networkImageCount;
-      console.log(`[CDN] Homepage loaded ${homepageImageCount} images (not counted in results)`);
-
-    } catch (e) {
-      lastNavError = e;
-      // If homepage itself fails, try to find a direct inner page
-      homepageLinks = [];
+    // First: try guessed paths with a fast HEAD check to see which exist
+    const validInnerPages = [];
+    for (const candidate of candidateUrls.slice(0, GUESSED_PATHS.length)) {
+      if (validInnerPages.length >= MAX_PAGES) break;
+      try {
+        const check = await page.evaluate(async (checkUrl) => {
+          try {
+            const r = await fetch(checkUrl, { method: 'HEAD', redirect: 'follow' });
+            return r.ok && r.url !== checkUrl.replace(/\/$/, '') + '/'; // not redirecting to homepage
+          } catch { return false; }
+        }, candidate).catch(() => false);
+        if (check) validInnerPages.push(candidate);
+      } catch { /* ignore */ }
     }
 
-    if (homepageLinks.length === 0 && lastNavError) {
-      // Homepage completely failed
+    // If no guessed paths work, fall back to loading homepage and extracting links
+    if (validInnerPages.length === 0) {
+      console.log(`[CDN] No guessed paths found — loading homepage for links: ${url}`);
+      try {
+        await navigateTo(url);
+        await dismissCookies();
+        const found = await findInnerPages(url, MAX_PAGES);
+        validInnerPages.push(...found);
+        // Reset counters — don't count homepage images
+        networkImageCount = 0;
+        domImageCount = 0;
+      } catch (e) {
+        lastNavError = e;
+      }
+    }
+
+    // If still nothing, use homepage itself
+    if (validInnerPages.length === 0 && !lastNavError) {
+      validInnerPages.push(url);
+    }
+
+    if (validInnerPages.length === 0 && lastNavError) {
       const errMsg = lastNavError.message || 'Unknown error';
       const reason = errMsg.includes('CERT') || errMsg.includes('SSL')
         ? `SSL/Certificate error: ${errMsg}`
@@ -730,51 +766,42 @@ async function crawlSite(browser, rawUrl) {
       return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', techStack: '', matchedUrl: '', confidence: 'Low', detail: reason, reason };
     }
 
-    // Reset counters — start fresh for inner page scanning
-    networkImageCount = 0;
-    domImageCount = 0;
-    // Keep any CDN/server signals already found from homepage network requests
-    // but reset image count so inner pages are counted separately
+    console.log(`[CDN] Pages to scan: ${validInnerPages.join(', ')}`);
 
-    // ── STEP 2: Scan inner pages (category/product pages) ────────────────────
-    // Both Network tab (auto via response listener) and Elements tab (DOM scan)
-    const pagesToScan = homepageLinks.length > 0
-      ? homepageLinks
-      : [url]; // fallback to homepage if no inner pages found
-
-    for (let pageIdx = 0; pageIdx < pagesToScan.length; pageIdx++) {
+    // ── STEP 3: Scan each valid inner page ───────────────────────────────────
+    for (let pageIdx = 0; pageIdx < validInnerPages.length; pageIdx++) {
       if (done) break;
 
-      const targetUrl = pagesToScan[pageIdx];
-      console.log(`[CDN] Step 2.${pageIdx + 1}: Scanning inner page: ${targetUrl}`);
+      const targetUrl = validInnerPages[pageIdx];
+      console.log(`[CDN] Scanning page ${pageIdx + 1}: ${targetUrl}`);
+      pagesScanned++;
 
       try {
         await navigateTo(targetUrl);
         await dismissCookies();
 
-        // Short wait for lazy images to start loading
+        // Short wait for lazy images
         await new Promise(r => setTimeout(r, AFTER_WAIT));
 
-        // ── ELEMENTS TAB SCAN: extract all image URLs from DOM ────────────────
-        console.log(`[CDN] Running DOM Elements scan on: ${targetUrl}`);
+        // ── ELEMENTS TAB: scan all image URLs in DOM ──────────────────────────
         await scanDOMElements();
 
-        // ── Scroll to trigger lazy-loaded images (Network tab captures these) ─
+        // ── NETWORK TAB: scroll to trigger lazy-loaded images ─────────────────
         await humanScroll(SCROLL_PX);
 
-        // Additional wait for any remaining lazy images
-        await new Promise(r => setTimeout(r, 1000));
+        // Brief final wait
+        await new Promise(r => setTimeout(r, 500));
 
-        console.log(`[CDN] Page ${pageIdx + 1} done — Network: ${networkImageCount} imgs, DOM: ${domImageCount} imgs, CDN: ${cdnFromUrl || 'none yet'}`);
+        console.log(`[CDN] Page ${pageIdx + 1} done — Network: ${networkImageCount}, DOM: ${domImageCount}, CDN: ${cdnFromUrl || 'none'}`);
 
       } catch (e) {
-        console.log(`[CDN] Inner page ${pageIdx + 1} failed: ${e.message}`);
-        continue; // try next inner page
+        console.log(`[CDN] Page ${pageIdx + 1} failed: ${e.message}`);
+        continue;
       }
 
-      // If we found a high-confidence CDN, stop scanning more pages
+      // Stop early if high-confidence CDN found
       if (done || (cdnFromUrl && getCDNPriority(cdnFromUrl) >= 8 && matchedUrl)) {
-        console.log(`[CDN] High-confidence CDN found — stopping after page ${pageIdx + 1}`);
+        console.log(`[CDN] High-confidence CDN found — stopping`);
         break;
       }
     }
