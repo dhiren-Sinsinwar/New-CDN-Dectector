@@ -402,7 +402,7 @@ async function writeToSheet(sheetId,updates){
 }
 
 // ── Per-company polling with auto-restart on timeout ─────────────────────────
-const CONCURRENCY = 5; // parallel crawls — balanced for CPU
+const CONCURRENCY = 6; // parallel crawls — matches server PARALLEL
 const MAX_RETRIES_PER_COMPANY = 1; // only 1 retry — don't waste time
 const COMPANY_TIMEOUT_MS = 30000; // 30s per company (was 60s)
 const RETRY_DELAY_MS = 500;       // 0.5s between retries (was 3s)
