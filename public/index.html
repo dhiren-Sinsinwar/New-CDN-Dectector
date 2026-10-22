@@ -402,10 +402,10 @@ async function writeToSheet(sheetId,updates){
 }
 
 // ── Per-company polling with auto-restart on timeout ─────────────────────────
-const CONCURRENCY = 8; // parallel crawls
-const MAX_RETRIES_PER_COMPANY = 3;
-const COMPANY_TIMEOUT_MS = 60000; // 60s per company before auto-retry
-const RETRY_DELAY_MS = 3000;      // wait 3s between retries
+const CONCURRENCY = 5; // parallel crawls — balanced for CPU
+const MAX_RETRIES_PER_COMPANY = 1; // only 1 retry — don't waste time
+const COMPANY_TIMEOUT_MS = 30000; // 30s per company (was 60s)
+const RETRY_DELAY_MS = 500;       // 0.5s between retries (was 3s)
 
 // Track which companies are done so auto-restart skips them
 const completedIndices = new Set();
@@ -451,9 +451,8 @@ async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
                 : `Failed after ${MAX_RETRIES_PER_COMPANY} retries: ${err.message}`;
               result = { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', techStack: '', matchedUrl: '', confidence: 'Low', detail: reason, reason };
             } else {
-              const waitMs = RETRY_DELAY_MS * retries;
-              log(`${entry.company}: ${isTimeout ? 'timeout' : 'error'} — retry ${retries}/${MAX_RETRIES_PER_COMPANY} in ${waitMs/1000}s`, 'err');
-              await new Promise(r => setTimeout(r, waitMs));
+              log(`${entry.company}: ${isTimeout ? 'timeout' : 'error'} — retry ${retries}/${MAX_RETRIES_PER_COMPANY}`, 'err');
+              await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
             }
           }
         }
