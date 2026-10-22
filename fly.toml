@@ -1,26 +1,16 @@
-# fly.toml app configuration file generated for new-cdn-dectector-dz40ug on 2026-10-06T07:28:48Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
 app = 'new-cdn-dectector-dz40ug'
 primary_region = 'ams'
 
 [build]
-  dockerfile = 'Dockerfile'
 
 [http_service]
-  internal_port = 8080
+  internal_port = 3000
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
-
-  [http_service.concurrency]
-    type = 'requests'
-    hard_limit = 10
-    soft_limit = 5
+  min_machines_running = 1
 
 [[vm]]
-  size = 'shared-cpu-1x'
   memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
