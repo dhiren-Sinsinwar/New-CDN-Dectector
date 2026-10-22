@@ -7,11 +7,11 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const MAX_IMAGES   = 100;   // max images to check per page (reduced for speed)
-const PARALLEL     = 8;     // concurrent crawls (increased for speed)
-const PAGE_TIMEOUT = 15000; // 15s per page load (reduced)
-const AFTER_WAIT   = 800;   // wait after load for lazy images (reduced)
-const SCROLL_PX    = 2500;  // scroll depth (reduced — CDN signals in first screenful)
+const MAX_IMAGES   = 80;    // max images per page
+const PARALLEL     = 4;     // server-side parallel Chrome instances (CPU-bound)
+const PAGE_TIMEOUT = 12000; // 12s per page load
+const AFTER_WAIT   = 600;   // wait after load
+const SCROLL_PX    = 2000;  // scroll depth
 
 // ── CDN URL patterns ──────────────────────────────────────────────────────────
 const CDN_URL_PATTERNS = [
