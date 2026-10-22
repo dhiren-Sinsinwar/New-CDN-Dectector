@@ -7,11 +7,11 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const MAX_IMAGES   = 80;    // max images per page
-const PARALLEL     = 4;     // server-side parallel Chrome instances (CPU-bound)
-const PAGE_TIMEOUT = 12000; // 12s per page load
-const AFTER_WAIT   = 600;   // wait after load
-const SCROLL_PX    = 2000;  // scroll depth
+const MAX_IMAGES   = 100;   // max images per page
+const PARALLEL     = 6;     // server-side parallel Chrome instances
+const PAGE_TIMEOUT = 15000; // 15s per page load
+const AFTER_WAIT   = 800;   // wait after load
+const SCROLL_PX    = 2500;  // scroll depth
 
 // ── CDN URL patterns ──────────────────────────────────────────────────────────
 const CDN_URL_PATTERNS = [
@@ -277,11 +277,16 @@ function normalise(raw) {
   try { new URL(raw); return raw; } catch { return null; }
 }
 
+// Only real content image types — no SVG logos, GIFs, ICO favicons, BMP
 const IMAGE_TYPES = [
-  'image/jpeg','image/jpg','image/png','image/gif','image/webp',
-  'image/avif','image/svg+xml','image/bmp','image/tiff','image/x-icon',
+  'image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/avif',
 ];
+// Also check URL extension as a fallback when content-type is missing/wrong
+const IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|avif)(\?|$|#)/i;
 function isImgCT(ct = '') { return IMAGE_TYPES.some(t => ct.toLowerCase().includes(t)); }
+function isContentImage(url = '', ct = '') {
+  return isImgCT(ct) || IMAGE_EXTENSIONS.test(url);
+}
 
 // ── Excluded URLs (bot challenges, trackers, etc.) ────────────────────────────
 const EXCLUDED_URL_PATTERNS = [
@@ -348,12 +353,44 @@ async function crawlSite(browser, rawUrl) {
   let damFromUrl   = null;
   let matchedUrl   = null;
   let bestImageUrl = null;
-  const techStackSet = new Set();  // all tech stack signals collected
+  let largestImageUrl = null;   // URL of the largest image seen (by Content-Length)
+  let largestImageSize = 0;     // bytes
+  const techStackSet = new Set();
+
+  // ── Endpoint (domain) tracker ─────────────────────────────────────────────
+  // Counts how many content images come from each hostname
+  // The majority domain = the real image serving infrastructure
+  const endpointCounts = {};   // { 'images.xyz.com': 12, 'cdn.abc.com': 3 }
+  const endpointCDN    = {};   // { 'images.xyz.com': 'Cloudinary' }
+
+  function trackEndpoint(imgUrl, cdnName) {
+    try {
+      const host = new URL(imgUrl).hostname;
+      endpointCounts[host] = (endpointCounts[host] || 0) + 1;
+      if (cdnName && !endpointCDN[host]) endpointCDN[host] = cdnName;
+    } catch { /* ignore */ }
+  }
+
+  // Find the endpoint with the most images
+  function getMajorityEndpoint() {
+    let topHost = null, topCount = 0;
+    for (const [host, count] of Object.entries(endpointCounts)) {
+      if (count > topCount) { topCount = count; topHost = host; }
+    }
+    return topHost ? { host: topHost, count: topCount, cdn: endpointCDN[topHost] || null } : null;
+  }
+
   let page;
 
   // ── Process a single image URL (shared between DOM and Network scans) ─────
   function processImageUrl(imgUrl, source) {
     if (!imgUrl || isExcludedUrl(imgUrl)) return;
+    // DOM scan: only keep jpg/jpeg/png/webp/avif — no SVG/GIF/ICO
+    if (source === 'dom') {
+      if (!/\.(jpe?g|png|webp|avif)(\?|$|#)/i.test(imgUrl)) return;
+      if (/logo|icon|sprite|favicon|badge|flag|arrow|bullet|avatar/i.test(imgUrl) &&
+          !/product|photo|image|img|banner|hero|background/i.test(imgUrl)) return;
+    }
 
     // CDN detection
     const urlCDN = detectCDNFromUrl(imgUrl);
@@ -471,8 +508,12 @@ async function crawlSite(browser, rawUrl) {
         if (dam && !damFromUrl) damFromUrl = dam;
         detectTechStackFromUrl(resUrl).forEach(s => techStackSet.add(s));
 
-        // Only process image responses (Network → Img tab)
-        if ((rt !== 'image' && !isImgCT(ct)) || status < 200 || status >= 400) return;
+        // Only process real content images (JPEG/PNG/WebP/AVIF) — skip SVG/GIF/ICO
+        const isRealImage = (rt === 'image' || isContentImage(resUrl, ct));
+        if (!isRealImage || status < 200 || status >= 400) return;
+        // Extra filter: skip obvious logos/icons/sprites from URL
+        if (/logo|icon|sprite|favicon|badge|flag|arrow|bullet|avatar/i.test(resUrl) &&
+            !/product|photo|image|img|banner|hero|background/i.test(resUrl)) return;
 
         networkImageCount++;
         if (networkImageCount > MAX_IMAGES) {
@@ -486,6 +527,17 @@ async function crawlSite(browser, rawUrl) {
         if (rawSvr && !serverHeader) serverHeader = rawSvr;
         const svrCDN = detectFromServerHeader(headers);
         if (svrCDN && !serverCDN) serverCDN = svrCDN;
+
+        // Track image size from Content-Length header
+        const contentLength = parseInt(headers['content-length'] || '0', 10);
+        if (contentLength > largestImageSize) {
+          largestImageSize = contentLength;
+          largestImageUrl  = resUrl;
+        }
+
+        // Track endpoint (hostname) counts
+        const urlCDNForEndpoint = detectCDNFromUrl(resUrl);
+        trackEndpoint(resUrl, urlCDNForEndpoint);
 
         // Process the image URL
         processImageUrl(resUrl, 'network');
@@ -607,10 +659,10 @@ async function crawlSite(browser, rawUrl) {
             } catch { /* ignore */ }
           });
 
-          // 6. <script> JSON blobs — image URLs embedded in JS data
+          // 6. <script> JSON blobs — only jpg/jpeg/png/webp/avif (not svg/gif)
           document.querySelectorAll('script').forEach(s => {
             const text = s.textContent || '';
-            const matches = text.match(/https?:\/\/[^\s"'<>]+\.(?:jpg|jpeg|png|webp|gif|avif|svg)[^\s"'<>]*/gi) || [];
+            const matches = text.match(/https?:\/\/[^\s"'<>]+\.(?:jpg|jpeg|png|webp|avif)[^\s"'<>]*/gi) || [];
             matches.forEach(u => urls.add(u));
           });
 
@@ -690,12 +742,9 @@ async function crawlSite(browser, rawUrl) {
     // ═══════════════════════════════════════════════════════════════════════════
 
     // ── STEP 1: Build candidate inner page URLs ──────────────────────────────
-    // Strategy: guess common paths directly (saves 5-8s vs loading homepage first)
-    // Falls back to homepage link-scraping only if guessed paths fail
     const baseUrl = new URL(url);
     const origin  = baseUrl.origin;
 
-    // Common inner page paths ordered by image richness
     const GUESSED_PATHS = [
       '/products', '/shop', '/store', '/collections', '/category',
       '/categories', '/catalogue', '/catalog', '/range', '/ranges',
@@ -704,52 +753,39 @@ async function crawlSite(browser, rawUrl) {
       '/about', '/team', '/blog', '/news',
     ];
 
-    // Build candidate URLs from guessed paths + homepage fallback
-    const candidateUrls = [
-      ...GUESSED_PATHS.map(p => origin + p),
-      url, // homepage as last resort
-    ];
-
-    // ── STEP 2: Try candidates until we get a working inner page ─────────────
+    // ── STEP 2: Probe candidates with HEAD check ──────────────────────────────
     let lastNavError = null;
     let pagesScanned = 0;
-    const MAX_PAGES  = 3; // scan up to 3 inner pages
+    const MAX_PROBE   = 6;  // probe up to 6 paths
+    const MAX_SCAN    = 2;  // fully scan the best 2 pages
 
-    // First: try guessed paths with a fast HEAD check to see which exist
     const validInnerPages = [];
-    for (const candidate of candidateUrls.slice(0, GUESSED_PATHS.length)) {
-      if (validInnerPages.length >= MAX_PAGES) break;
+    for (const candidate of GUESSED_PATHS.map(p => origin + p).slice(0, MAX_PROBE)) {
       try {
         const check = await page.evaluate(async (checkUrl) => {
           try {
             const r = await fetch(checkUrl, { method: 'HEAD', redirect: 'follow' });
-            return r.ok && r.url !== checkUrl.replace(/\/$/, '') + '/'; // not redirecting to homepage
+            return r.ok;
           } catch { return false; }
         }, candidate).catch(() => false);
         if (check) validInnerPages.push(candidate);
       } catch { /* ignore */ }
     }
 
-    // If no guessed paths work, fall back to loading homepage and extracting links
+    // Fall back to homepage link extraction if no guessed paths work
     if (validInnerPages.length === 0) {
-      console.log(`[CDN] No guessed paths found — loading homepage for links: ${url}`);
+      console.log(`[CDN] No guessed paths — loading homepage for links`);
       try {
         await navigateTo(url);
         await dismissCookies();
-        const found = await findInnerPages(url, MAX_PAGES);
+        const found = await findInnerPages(url, MAX_PROBE);
         validInnerPages.push(...found);
-        // Reset counters — don't count homepage images
         networkImageCount = 0;
         domImageCount = 0;
-      } catch (e) {
-        lastNavError = e;
-      }
+      } catch (e) { lastNavError = e; }
     }
 
-    // If still nothing, use homepage itself
-    if (validInnerPages.length === 0 && !lastNavError) {
-      validInnerPages.push(url);
-    }
+    if (validInnerPages.length === 0 && !lastNavError) validInnerPages.push(url);
 
     if (validInnerPages.length === 0 && lastNavError) {
       const errMsg = lastNavError.message || 'Unknown error';
@@ -766,36 +802,61 @@ async function crawlSite(browser, rawUrl) {
       return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', techStack: '', matchedUrl: '', confidence: 'Low', detail: reason, reason };
     }
 
-    console.log(`[CDN] Pages to scan: ${validInnerPages.join(', ')}`);
+    // ── STEP 3: Quick-scan each candidate to count images — pick richest ──────
+    // Load each candidate, count how many content images it has, then
+    // fully scan the page with the MOST images for best CDN detection
+    console.log(`[CDN] Probing ${validInnerPages.length} pages to find image-richest`);
 
-    // ── STEP 3: Scan each valid inner page ───────────────────────────────────
-    for (let pageIdx = 0; pageIdx < validInnerPages.length; pageIdx++) {
+    const pageImageCounts = {}; // { url: count }
+
+    for (const candidatePage of validInnerPages) {
+      if (done) break;
+      try {
+        let imgCountBefore = networkImageCount;
+        await navigateTo(candidatePage);
+        await new Promise(r => setTimeout(r, 600)); // brief wait for images to start
+        // Quick DOM count (fast — no full scan yet)
+        const quickCount = await page.evaluate(() => {
+          return document.querySelectorAll('img[src], img[data-src], img[data-lazy-src]').length;
+        }).catch(() => 0);
+        const networkGain = networkImageCount - imgCountBefore;
+        pageImageCounts[candidatePage] = quickCount + networkGain;
+        console.log(`[CDN] ${candidatePage} → ~${pageImageCounts[candidatePage]} images`);
+      } catch { pageImageCounts[candidatePage] = 0; }
+    }
+
+    // Sort by image count — richest pages first
+    const rankedPages = validInnerPages
+      .sort((a, b) => (pageImageCounts[b] || 0) - (pageImageCounts[a] || 0))
+      .slice(0, MAX_SCAN);
+
+    console.log(`[CDN] Richest pages: ${rankedPages.map(p => p + '(' + pageImageCounts[p] + ')').join(', ')}`);
+
+    // ── STEP 4: Full scan of the richest page(s) ─────────────────────────────
+    for (let pageIdx = 0; pageIdx < rankedPages.length; pageIdx++) {
       if (done) break;
 
-      const targetUrl = validInnerPages[pageIdx];
-      console.log(`[CDN] Scanning page ${pageIdx + 1}: ${targetUrl}`);
+      const targetUrl = rankedPages[pageIdx];
+      console.log(`[CDN] Full scan of page ${pageIdx + 1}: ${targetUrl}`);
       pagesScanned++;
 
       try {
         await navigateTo(targetUrl);
         await dismissCookies();
-
-        // Short wait for lazy images
         await new Promise(r => setTimeout(r, AFTER_WAIT));
 
-        // ── ELEMENTS TAB: scan all image URLs in DOM ──────────────────────────
+        // DOM scan (Elements tab)
         await scanDOMElements();
 
-        // ── NETWORK TAB: scroll to trigger lazy-loaded images ─────────────────
+        // Scroll to trigger lazy images (Network tab captures these)
         await humanScroll(SCROLL_PX);
 
-        // Brief final wait
         await new Promise(r => setTimeout(r, 500));
 
-        console.log(`[CDN] Page ${pageIdx + 1} done — Network: ${networkImageCount}, DOM: ${domImageCount}, CDN: ${cdnFromUrl || 'none'}`);
+        console.log(`[CDN] Full scan done — Network: ${networkImageCount}, DOM: ${domImageCount}, CDN: ${cdnFromUrl || 'none yet'}`);
 
       } catch (e) {
-        console.log(`[CDN] Page ${pageIdx + 1} failed: ${e.message}`);
+        console.log(`[CDN] Full scan failed: ${e.message}`);
         continue;
       }
 
@@ -819,9 +880,41 @@ async function crawlSite(browser, rawUrl) {
 
   // ── Score and build result ────────────────────────────────────────────────
   const totalImages = networkImageCount + domImageCount;
-  const finalCDN    = cdnFromUrl || serverCDN || 'Not available';
-  const finalDAM    = damFromUrl || 'Not available';
-  const finalUrl    = matchedUrl || bestImageUrl || '';
+
+  // ── Majority endpoint analysis ─────────────────────────────────────────────
+  // The endpoint with the most images is the real CDN — more reliable than
+  // the first CDN signal found
+  const majorityEP = getMajorityEndpoint();
+  let majorityHostCDN = null;
+  if (majorityEP && majorityEP.count >= 3) {
+    // Check if majority endpoint itself reveals CDN
+    majorityHostCDN = majorityEP.cdn || detectCDNFromUrl('https://' + majorityEP.host + '/');
+    console.log(`[CDN] Majority endpoint: ${majorityEP.host} (${majorityEP.count} images)${majorityHostCDN ? ' → ' + majorityHostCDN : ''}`);
+  }
+
+  // Priority: majority endpoint CDN > URL CDN > server CDN
+  // But respect the priority score system — don't let a low-priority
+  // majority override a high-priority explicit match
+  let finalCDN;
+  if (majorityHostCDN && cdnFromUrl) {
+    finalCDN = getCDNPriority(majorityHostCDN) >= getCDNPriority(cdnFromUrl)
+      ? majorityHostCDN : cdnFromUrl;
+  } else {
+    finalCDN = majorityHostCDN || cdnFromUrl || serverCDN || 'Not available';
+  }
+
+  const finalDAM = damFromUrl || 'Not available';
+
+  // Prefer: matched CDN URL → largest image URL → best content image URL
+  const finalUrl = matchedUrl || largestImageUrl || bestImageUrl || '';
+
+  // Log endpoint summary
+  const epSummary = Object.entries(endpointCounts)
+    .sort((a,b) => b[1]-a[1])
+    .slice(0,3)
+    .map(([h,c]) => `${h}(${c})`)
+    .join(', ');
+  if (epSummary) console.log(`[CDN] Endpoint breakdown: ${epSummary}`);
 
   // Tech stack — dedupe and join
   // Remove CDN names that are already in the CDN column to avoid repetition
