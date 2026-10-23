@@ -82,8 +82,8 @@ button.primary.restart:hover{background:#1e40af}
 button.ghost{background:transparent;color:var(--accent);border:.5px solid var(--accent);border-radius:7px;padding:6px 14px;font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:background .15s}
 button.ghost:hover{background:rgba(212,245,122,.08)}
 .table-wrap{background:var(--bg2);border:.5px solid var(--border);border-radius:14px;overflow:hidden}
-.table-head{display:grid;grid-template-columns:1fr 1fr 1fr .9fr .9fr 1fr .6fr 1.4fr 1.4fr;font-size:10.5px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;padding:10px 16px;background:var(--bg3);border-bottom:.5px solid var(--border)}
-.table-row{display:grid;grid-template-columns:1fr 1fr 1fr .9fr .9fr 1fr .6fr 1.4fr 1.4fr;padding:11px 16px;border-bottom:.5px solid var(--border);align-items:center;font-size:13px;transition:background .1s;animation:rowIn .28s ease both}
+.table-head{display:grid;grid-template-columns:1fr 1fr 1fr .8fr .8fr .9fr .8fr .5fr 1.2fr 1.2fr;font-size:10.5px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;padding:10px 16px;background:var(--bg3);border-bottom:.5px solid var(--border)}
+.table-row{display:grid;grid-template-columns:1fr 1fr 1fr .8fr .8fr .9fr .8fr .5fr 1.2fr 1.2fr;padding:11px 16px;border-bottom:.5px solid var(--border);align-items:center;font-size:13px;transition:background .1s;animation:rowIn .28s ease both}
 .table-row:last-child{border-bottom:none}
 .table-row:hover{background:var(--bg3)}
 @keyframes rowIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
@@ -221,7 +221,7 @@ button.ghost:hover{background:rgba(212,245,122,.08)}
       <button class="ghost" onclick="exportCSV()">Export CSV</button>
     </div>
     <div class="table-wrap">
-      <div class="table-head"><div>Company</div><div>Website</div><div>ID from URL</div><div>Server</div><div>DAM</div><div>Tech Stack</div><div>Confidence</div><div>Matched URL</div><div>Error / Reason</div></div>
+      <div class="table-head"><div>Company</div><div>Website</div><div>ID from URL</div><div>Server</div><div>DAM</div><div>Tech Stack</div><div>CDN from DNS</div><div>Confidence</div><div>Matched URL</div><div>Error / Reason</div></div>
       <div id="tableBody"></div>
     </div>
     <div class="log-box" id="logBox"></div>
@@ -407,13 +407,14 @@ const MAX_RETRIES_PER_COMPANY = 1; // only 1 retry — don't waste time
 const COMPANY_TIMEOUT_MS = 30000; // 30s per company (was 60s)
 const RETRY_DELAY_MS = 500;       // 0.5s between retries (was 3s)
 
-// Track which companies are done so auto-restart skips them
-const completedIndices = new Set();
-let autoRestartCount = 0;
 const MAX_AUTO_RESTARTS = 5;
 
 async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
   const base = serverUrl.replace(/\/$/, '');
+
+  // Reset per-run tracking — fresh set each time crawlAll is called
+  const completedIndices = new Set();
+  let autoRestartCount = 0;
 
   // Only process entries not yet completed
   const remaining = () => allEntries.filter(e => !completedIndices.has(e.index) && !stopRequested);
@@ -483,7 +484,7 @@ async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
 
       if (autoRestartCount > MAX_AUTO_RESTARTS) {
         log(`Auto-restart limit reached — ${stillLeft} companies skipped`, 'err');
-        setStatus(`Stopped after ${MAX_AUTO_RESTARTS} restarts — ${completedIndices.size} done`, 'error');
+        setStatus(`Stopped after ${MAX_AUTO_RESTARTS} restarts`, 'error');
         break;
       }
 
@@ -505,7 +506,7 @@ async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
 
       if (!serverBack) {
         log('Server did not recover after 60s — stopping', 'err');
-        setStatus(`Server unreachable — ${completedIndices.size} done, ${remaining().length} skipped`, 'error');
+        setStatus(`Server unreachable — ${remaining().length} skipped`, 'error');
         break;
       }
 
@@ -546,7 +547,12 @@ function techStackBadge(stack){
   const items = stack.split(',').slice(0,3);
   return items.map(s => `<span style="display:inline-block;font-size:10px;background:#1a1030;color:#c4b5fd;border:.5px solid #3a2060;border-radius:4px;padding:1px 6px;margin:1px">${esc(s.trim())}</span>`).join('');
 }
-function rowHtml(i,co,web,cdn,server,dam,stack,conf,mUrl,reason){
+function dnsBadge(dnscdn, cname){
+  if(!dnscdn) return '<span style="color:var(--muted);font-size:11px">—</span>';
+  const tip = cname ? `CNAME: ${cname}` : dnscdn;
+  return `<span style="display:inline-block;font-size:10px;background:#0a1a2a;color:#67e8f9;border:.5px solid #164e63;border-radius:4px;padding:2px 6px" title="${esc(tip)}">${esc(dnscdn)}</span>`;
+}
+function rowHtml(i,co,web,cdn,server,dam,stack,dnscdn,cname,conf,mUrl,reason){
   const shortUrl = mUrl ? mUrl.slice(0,50)+(mUrl.length>50?'…':'') : '—';
   return `<div class="table-row" id="row-${i}" style="animation-delay:${Math.min(i*25,350)}ms">
     <div class="c-co" title="${esc(co)}">${esc(co)}</div>
@@ -555,14 +561,15 @@ function rowHtml(i,co,web,cdn,server,dam,stack,conf,mUrl,reason){
     <div>${serverBadge(server)}</div>
     <div>${damBadge(dam)}</div>
     <div>${techStackBadge(stack)}</div>
+    <div>${dnsBadge(dnscdn, cname)}</div>
     <div>${confBadge(conf)}</div>
     <div class="c-detail" title="${esc(mUrl||'')}">${shortUrl}</div>
     <div>${reasonBadge(cdn, reason)}</div>
   </div>`;
 }
-function updateRow(i,co,web,cdn,server,dam,stack,conf,mUrl,reason){
+function updateRow(i,co,web,cdn,server,dam,stack,dnscdn,cname,conf,mUrl,reason){
   const el=document.getElementById('row-'+i);
-  const html=rowHtml(i,co,web,cdn,server,dam,stack,conf,mUrl,reason);
+  const html=rowHtml(i,co,web,cdn,server,dam,stack,dnscdn,cname,conf,mUrl,reason);
   if(el)el.outerHTML=html;else document.getElementById('tableBody').insertAdjacentHTML('beforeend',html);
 }
 function updateSummary(){
@@ -628,12 +635,13 @@ async function run(){
 
   const entries=rows.slice(1).filter(r=>r[websiteIdx]).map((r,i)=>({row:i+2,company:r[companyIdx]||'',website:r[websiteIdx]||''}));
   document.getElementById('sumTotal').textContent=entries.length;
-  entries.forEach((e,i)=>updateRow(i,e.company,e.website,'…','','','','—','',''));
+  entries.forEach((e,i)=>updateRow(i,e.company,e.website,'…','','','','','','—','',''));
 
   let cdnCol    = header.findIndex(h=>/identification.*url|imgix.?cloudinary|cdn/i.test(h));
   let serverCol = header.findIndex(h=>/^server$/i.test(h));
   let damCol    = header.findIndex(h=>/^dam$/i.test(h));
   let techCol   = header.findIndex(h=>/tech.?stack|platform|stack/i.test(h));
+  let dnsCol    = header.findIndex(h=>/dns|cname/i.test(h));
   let confCol   = header.findIndex(h=>/confidence/i.test(h));
   let urlCol    = header.findIndex(h=>/^url$/i.test(h));
   let reasonCol = header.findIndex(h=>/error|reason/i.test(h));
@@ -642,6 +650,7 @@ async function run(){
   if(serverCol===-1){serverCol=newHeader.length;  newHeader.push('Server');}
   if(damCol===-1)   {damCol=newHeader.length;     newHeader.push('DAM');}
   if(techCol===-1)  {techCol=newHeader.length;    newHeader.push('Tech Stack');}
+  if(dnsCol===-1)   {dnsCol=newHeader.length;     newHeader.push('CDN from DNS (CNAME)');}
   if(confCol===-1)  {confCol=newHeader.length;    newHeader.push('Confidence Score');}
   if(urlCol===-1)   {urlCol=newHeader.length;     newHeader.push('URL');}
   if(reasonCol===-1){reasonCol=newHeader.length;  newHeader.push('Error / Reason');}
@@ -665,7 +674,7 @@ async function run(){
     (ev) => {
       if(stopRequested) return;
       setStatus(`Scanning ${ev.company}…`, 'running', `${ev.done||0} / ${entries.length}`);
-      updateRow(ev.index, ev.company, entries[ev.index].website, '…', '', '', '', '—', '', '');
+      updateRow(ev.index, ev.company, entries[ev.index].website, '…', '', '', '', '', '', '—', '', '');
     },
     // onResult
     (ev) => {
@@ -673,24 +682,26 @@ async function run(){
       const server      = ev.server      || '';
       const damFromUrl  = ev.damFromUrl  || 'Not available';
       const techStack   = ev.techStack   || '';
+      const cdnFromDNS  = ev.cdnFromDNS  || '';
+      const cnameRecord = ev.cnameRecord || '';
       const confidence  = ev.confidence  || 'Low';
       const matchedUrl  = ev.matchedUrl  || '';
       const reason      = ev.reason      || '';
-      results[ev.index] = { company: ev.company, website: entries[ev.index].website, cdnFromUrl, server, damFromUrl, techStack, confidence, matchedUrl, reason };
-      updateRow(ev.index, ev.company, entries[ev.index].website, cdnFromUrl, server, damFromUrl, techStack, confidence, matchedUrl, reason);
+      results[ev.index] = { company: ev.company, website: entries[ev.index].website, cdnFromUrl, server, damFromUrl, techStack, cdnFromDNS, cnameRecord, confidence, matchedUrl, reason };
+      updateRow(ev.index, ev.company, entries[ev.index].website, cdnFromUrl, server, damFromUrl, techStack, cdnFromDNS, cnameRecord, confidence, matchedUrl, reason);
       updateSummary();
       setProgress(ev.done, ev.total, `Done: ${ev.company}`);
       setStatus(`Scanning… (${ev.done}/${ev.total})`, 'running', `${ev.done} / ${ev.total}`);
       const found = cdnFromUrl!=='Not available'||server||damFromUrl!=='Not available';
-      log(`${ev.company}: CDN=${cdnFromUrl} | Server=${server||'—'} | DAM=${damFromUrl} | Stack=${techStack||'—'}`, found?'ok':'err');
+      log(`${ev.company}: CDN=${cdnFromUrl} | DNS=${cdnFromDNS||'—'} | Server=${server||'—'} | DAM=${damFromUrl}`, found?'ok':'err');
       const entry = entries[ev.index];
 
       sheetUpdates.push({
         range: `${activeSheetName}!${colLetter(cdnCol)}${entry.row}:${colLetter(reasonCol)}${entry.row}`,
-        values: [[cdnFromUrl, server, damFromUrl, techStack, confidence, matchedUrl, reason]]
+        values: [[cdnFromUrl, server, damFromUrl, techStack, cdnFromDNS, confidence, matchedUrl, reason]]
       });
-      // Write to sheet immediately every 5 results — don't wait until end
-      if(oauthToken && sheetUpdates.length % 5 === 0){
+      // Write to sheet immediately every 5 NEW results
+      if(oauthToken && sheetUpdates.length > 0 && sheetUpdates.length % 5 === 0){
         const batch = sheetUpdates.slice(-5);
         writeToSheet(sheetId, batch).catch(e => log('Auto-save failed: '+e.message,'err'));
       }
@@ -729,8 +740,8 @@ async function run(){
 }
 
 function exportCSV(){
-  const rows=[['Company','Website','Identification from URL','Server','DAM','Tech Stack','Confidence Score','URL','Error / Reason']];
-  results.forEach(r=>{if(r)rows.push([r.company,r.website,r.cdnFromUrl,r.server,r.damFromUrl,r.techStack||'',r.confidence,r.matchedUrl,r.reason||'']);});
+  const rows=[['Company','Website','Identification from URL','Server','DAM','Tech Stack','CDN from DNS (CNAME)','Confidence Score','URL','Error / Reason']];
+  results.forEach(r=>{if(r)rows.push([r.company,r.website,r.cdnFromUrl,r.server,r.damFromUrl,r.techStack||'',r.cdnFromDNS||'',r.confidence,r.matchedUrl,r.reason||'']);});
   const csv=rows.map(r=>r.map(c=>`"${String(c||'').replace(/"/g,'""')}"`).join(',')).join('\n');
   const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download='cdn-results.csv';a.click();
 }
