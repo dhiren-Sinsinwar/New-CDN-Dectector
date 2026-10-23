@@ -687,6 +687,8 @@ async function crawlSite(browser, rawUrl) {
   let effectiveUrl = url;               // URL after redirects (bbw.com → bathandbodyworks.com)
   let blockedBy    = null;              // bot-protection vendor detected from a block page
   let navFailReason = null;             // why the homepage failed to load, if it did
+  let usedWayback  = false;             // image URLs came from the Wayback Machine
+  let usedUnblocker = null;             // image URLs came from a paid unblocker provider
   const seenDomUrls = new Set();        // DOM/HTML image URLs already counted
   let UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   const startedAt  = Date.now();
@@ -785,8 +787,6 @@ async function crawlSite(browser, rawUrl) {
     const UAS = [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
     ];
     let hash = 0;
@@ -794,21 +794,11 @@ async function crawlSite(browser, rawUrl) {
     UA = UAS[Math.abs(hash) % UAS.length];
     await page.setUserAgent(UA);
 
-    await page.setExtraHTTPHeaders({
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-      'Sec-CH-UA': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-      'Sec-CH-UA-Mobile': '?0',
-      'Sec-CH-UA-Platform': '"Windows"',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Upgrade-Insecure-Requests': '1',
-    });
+    // Only set what Chrome can't infer. Forcing Sec-Fetch-*/Sec-CH-UA on every request
+    // (including images and XHR) is a dead giveaway to Akamai/PerimeterX — Chrome sets them
+    // correctly per request type on its own.
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+    await page.emulateTimezone('America/New_York').catch(() => {});
 
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -985,6 +975,100 @@ async function crawlSite(browser, rawUrl) {
       } catch { return null; }
     }
 
+    // ── Soft retry when a challenge page is served: PerimeterX/Akamai score behaviour
+    //    and cookies; a second load after a few seconds of "human" activity sometimes passes.
+    async function softRetryAfterBlock() {
+      try {
+        console.log('[CDN] Block page detected — soft retry (mouse activity + reload)');
+        for (let i = 0; i < 4; i++) {
+          await page.mouse.move(200 + Math.random() * 1200, 150 + Math.random() * 700, { steps: 8 });
+          await new Promise(r => setTimeout(r, 500 + Math.random() * 600));
+        }
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 1500));
+        const still = await detectBlockPage();
+        if (!still) { console.log('[CDN] Soft retry passed the challenge'); return true; }
+        console.log(`[CDN] Still blocked by ${still}`);
+      } catch {}
+      return false;
+    }
+
+    // ── Mine image URLs out of an HTML string (shared by raw fetch, Wayback, scraping API) ──
+    function mineHtmlForImages(html, baseUrl, source) {
+      const found = new Set();
+      let base; try { base = new URL(baseUrl); } catch { base = null; }
+      const abs = /https?:\/\/[^\s"'<>()\\]+/gi; let m;
+      while ((m = abs.exec(html)) && found.size < 800) found.add(m[0].replace(/&amp;/g, '&').replace(/[,.;)]+$/, ''));
+      if (base) {
+        const rel = /(?:src|data-src|data-srcset|srcset|data-bg|data-background|data-original|data-lazy-src|content|href)=["']?(\/\/[^\s"'<>]+|\/[^\s"'<>]+)/gi;
+        while ((m = rel.exec(html)) && found.size < 1200) { try { found.add(new URL(m[1], base).href); } catch {} }
+      }
+      let n = 0;
+      for (const cand of found) {
+        const d = detectDAMFromUrl(cand); if (d && !damFromUrl) damFromUrl = d;
+        detectTechStackFromUrl(cand).forEach(t => techStackSet.add(t));
+        if (!looksLikeContentImage(cand) || isExcludedUrl(cand)) continue;
+        if (!isFromTrustedOrSameDomain(cand, trustedRoots)) continue;
+        if (seenDomUrls.has(cand)) continue;
+        seenDomUrls.add(cand);
+        trackEndpoint(cand, detectCDNFromUrl(cand));
+        processImageUrl(cand, 'html');
+        domImageCount++; n++;
+      }
+      console.log(`[${source}] ${n} content image URLs extracted (CDN: ${cdnFromUrl || 'none'})`);
+      return n;
+    }
+
+    // ── Wayback Machine fallback: archived HTML keeps the original CDN hostnames.
+    //    Free, works for sites that block us outright. "id_" returns raw original HTML.
+    async function waybackFallback(targetUrl) {
+      const tried = [targetUrl, targetUrl.replace(/^(https?:\/\/)(?!www\.)/i, '$1www.')];
+      for (const u of [...new Set(tried)]) {
+        try {
+          const wb = `https://web.archive.org/web/2024id_/${u}`;
+          console.log(`[WAYBACK] Fetching ${wb}`);
+          const r = await fetch(wb, { redirect: 'follow', headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(15000) });
+          if (!r.ok) { console.log(`[WAYBACK] HTTP ${r.status}`); continue; }
+          const html = await r.text();
+          if (html.length < 2000) continue;
+          // Strip any residual archive prefixes so hosts resolve to the original CDN
+          const clean = html.replace(/https?:\/\/web\.archive\.org\/web\/\d+[a-z_]*\//gi, '');
+          const n = mineHtmlForImages(clean, u, 'WAYBACK');
+          if (n > 0) { usedWayback = true; return true; }
+        } catch (e) { console.log(`[WAYBACK] ${e.message}`); }
+      }
+      return false;
+    }
+
+    // ── Optional paid unblocker (set env SCRAPING_PROVIDER + SCRAPING_API_KEY) ──
+    //    scrapingbee | scraperapi | zyte — routes blocked sites through residential IPs
+    //    with JS rendering. Zero code changes needed later; just set the env vars on Fly.
+    async function scrapingApiFallback(targetUrl) {
+      const provider = (process.env.SCRAPING_PROVIDER || '').toLowerCase();
+      const key = process.env.SCRAPING_API_KEY;
+      if (!provider || !key) return false;
+      let api, opts = { signal: AbortSignal.timeout(45000) };
+      if (provider === 'scrapingbee')
+        api = `https://app.scrapingbee.com/api/v1/?api_key=${encodeURIComponent(key)}&url=${encodeURIComponent(targetUrl)}&render_js=true&premium_proxy=true&stealth_proxy=true&country_code=us&wait=2500&block_resources=false`;
+      else if (provider === 'scraperapi')
+        api = `https://api.scraperapi.com/?api_key=${encodeURIComponent(key)}&url=${encodeURIComponent(targetUrl)}&render=true&premium=true&country_code=us`;
+      else if (provider === 'zyte') {
+        api = 'https://api.zyte.com/v1/extract';
+        opts = { ...opts, method: 'POST', headers: { 'Authorization': 'Basic ' + Buffer.from(key + ':').toString('base64'), 'Content-Type': 'application/json' },
+                 body: JSON.stringify({ url: targetUrl, browserHtml: true, geolocation: 'US' }) };
+      } else return false;
+      try {
+        console.log(`[UNBLOCK] ${provider} → ${targetUrl}`);
+        const r = await fetch(api, opts);
+        if (!r.ok) { console.log(`[UNBLOCK] HTTP ${r.status}`); return false; }
+        let html = provider === 'zyte' ? ((await r.json()).browserHtml || '') : await r.text();
+        if (html.length < 2000) return false;
+        const n = mineHtmlForImages(html, targetUrl, 'UNBLOCK');
+        if (n > 0) { usedUnblocker = provider; return true; }
+      } catch (e) { console.log(`[UNBLOCK] ${e.message}`); }
+      return false;
+    }
+
     // ── Raw-HTML fallback: fetch the page as a plain browser GET and mine image URLs ──
     // Bypasses JS-executed bot checks that blank out headless Chrome but still serve HTML.
     async function rawHtmlFallback(targetUrl) {
@@ -1023,25 +1107,7 @@ async function crawlSite(browser, rawUrl) {
             else if (/id="px-captcha"|press\s*&\s*hold|human verification/.test(lower)) blockedBy = 'PerimeterX';
             else if (/geo\.captcha-delivery\.com/.test(lower)) blockedBy = 'DataDome';
           }
-          const found = new Set();
-          const base = new URL(r.url);
-          const abs = /https?:\/\/[^\s"'<>()\\]+/gi; let m;
-          while ((m = abs.exec(html)) && found.size < 800) found.add(m[0].replace(/&amp;/g, '&').replace(/[,.;)]+$/, ''));
-          const rel = /(?:src|data-src|data-srcset|srcset|data-bg|data-background|data-original|data-lazy-src|content|href)=["']?(\/\/[^\s"'<>]+|\/[^\s"'<>]+)/gi;
-          while ((m = rel.exec(html)) && found.size < 1200) { try { found.add(new URL(m[1], base).href); } catch {} }
-          let n = 0;
-          for (const cand of found) {
-            const d = detectDAMFromUrl(cand); if (d && !damFromUrl) damFromUrl = d;
-            detectTechStackFromUrl(cand).forEach(t => techStackSet.add(t));
-            if (!looksLikeContentImage(cand) || isExcludedUrl(cand)) continue;
-            if (!isFromTrustedOrSameDomain(cand, trustedRoots)) continue;
-            if (seenDomUrls.has(cand)) continue;
-            seenDomUrls.add(cand);
-            trackEndpoint(cand, detectCDNFromUrl(cand));
-            processImageUrl(cand, 'html');
-            domImageCount++; n++;
-          }
-          console.log(`[HTML] ${n} content image URLs extracted (CDN: ${cdnFromUrl || 'none'})`);
+          const n = mineHtmlForImages(html, r.url, 'HTML');
           if (n > 0 || html.length > 3000) return;
         } catch (e) { console.log(`[HTML] Fallback failed for ${u}: ${e.message}`); }
       }
@@ -1400,7 +1466,8 @@ async function crawlSite(browser, rawUrl) {
       console.log(`[CDN] Homepage scan — Network: ${networkImageCount}, DOM: ${domImageCount}, CDN: ${cdnFromUrl || 'none'}`);
 
       // Block page? The vendor name is itself a CDN/WAF signal
-      const blk = await detectBlockPage();
+      let blk = await detectBlockPage();
+      if (blk && await softRetryAfterBlock()) { blk = null; await scanDOMElements(); }
       if (blk) { blockedBy = blk; console.log(`[CDN] Bot protection detected: ${blk}`); }
 
       // Inner page links — based on the URL we actually landed on
@@ -1473,9 +1540,12 @@ async function crawlSite(browser, rawUrl) {
       }
     }
 
-    // ── Phase C: raw-HTML fallback when the browser saw (almost) nothing ──────
-    if (networkImageCount + domImageCount < 5 && Date.now() - startedAt < BUDGET_MS + 8000) {
-      await rawHtmlFallback(effectiveUrl);
+    // ── Phase C: escalation ladder when the browser saw (almost) nothing ──────
+    //    raw HTML GET → paid unblocker (if configured) → Wayback Machine archive
+    if (networkImageCount + domImageCount < 5) {
+      if (Date.now() - startedAt < BUDGET_MS + 8000) await rawHtmlFallback(effectiveUrl);
+      if (networkImageCount + domImageCount < 5 && blockedBy) await scrapingApiFallback(effectiveUrl);
+      if (networkImageCount + domImageCount < 5 && Date.now() - startedAt < BUDGET_MS + 20000) await waybackFallback(effectiveUrl);
     }
 
   } catch (err) {
@@ -1574,7 +1644,10 @@ async function crawlSite(browser, rawUrl) {
     else
       reason = `${totalImages} images scanned — served from own domain, no CDN/DAM patterns`;
   } else if (blockedBy) {
-    reason = `Bot protection: ${blockedBy}${totalImages === 0 ? ' (CDN inferred from edge, no images rendered)' : ''}`;
+    const via = usedUnblocker ? ` — images via ${usedUnblocker}` : usedWayback ? ' — images via Wayback Machine archive' : (totalImages === 0 ? ' — CDN inferred from edge, no images rendered' : '');
+    reason = `Bot protection: ${blockedBy}${via}`;
+  } else if (usedWayback) {
+    reason = 'Browser saw no images — image URLs recovered from Wayback Machine archive';
   }
 
   const detail = `Network: ${networkImageCount} imgs, DOM: ${domImageCount} imgs${cdnFromUrl ? ' | CDN: '+cdnFromUrl : ''}${serverHeader ? ' | Server: '+serverHeader : ''}${finalDAM !== 'Not available' ? ' | DAM: '+finalDAM : ''}${techStackFinal ? ' | Stack: '+techStackFinal : ''}`;
@@ -1612,7 +1685,7 @@ app.post('/crawl-stream', async (req, res) => {
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
       ignoreHTTPSErrors: true,
       args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-             '--disable-gpu','--no-first-run','--no-zygote','--single-process',
+             '--disable-gpu','--no-first-run','--window-size=1920,1080','--lang=en-US,en',
              '--disable-blink-features=AutomationControlled','--ignore-certificate-errors'],
     });
 
@@ -1668,7 +1741,7 @@ app.post('/crawl', async (req, res) => {
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
     ignoreHTTPSErrors: true,
     args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-           '--disable-gpu','--no-first-run','--no-zygote','--single-process',
+           '--disable-gpu','--no-first-run','--window-size=1920,1080','--lang=en-US,en',
            '--disable-blink-features=AutomationControlled','--ignore-certificate-errors'],
   });
 
