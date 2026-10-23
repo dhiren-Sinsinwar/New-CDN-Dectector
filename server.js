@@ -569,6 +569,7 @@ async function crawlSite(browser, rawUrl) {
   let cdnFromUrl   = null;
   let cdnFromDNS   = null;  // CDN detected via DNS CNAME lookup
   let cnameRecord  = null;  // raw CNAME chain from DNS
+  let dnsPromise   = Promise.resolve(); // declared here so catch block can always await it
   let serverHeader = null;
   let serverCDN    = null;
   let damFromUrl   = null;
@@ -705,7 +706,7 @@ async function crawlSite(browser, rawUrl) {
 
     // ── DNS lookup — runs in parallel with page load ───────────────────────
     // Resolves CNAME chain to identify CDN (like running dig on the domain)
-    const dnsPromise = dnsLookupCDN(new URL(url).hostname).then(result => {
+    dnsPromise = dnsLookupCDN(new URL(url).hostname).then(result => {
       if (result) {
         cdnFromDNS  = result.cdn;
         cnameRecord = result.cname;
