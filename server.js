@@ -686,6 +686,7 @@ async function crawlSite(browser, rawUrl) {
   let dnsPromise   = Promise.resolve(); // declared here so catch block can always await it
   let effectiveUrl = url;               // URL after redirects (bbw.com → bathandbodyworks.com)
   let blockedBy    = null;              // bot-protection vendor detected from a block page
+  let navFailReason = null;             // why the homepage failed to load, if it did
   const seenDomUrls = new Set();        // DOM/HTML image URLs already counted
   let UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   const startedAt  = Date.now();
@@ -945,21 +946,41 @@ async function crawlSite(browser, rawUrl) {
     // ── Detect bot-protection / WAF block pages — the block itself names the CDN ──
     async function detectBlockPage() {
       try {
-        const info = await page.evaluate(() => ({
-          title: document.title || '',
-          text: ((document.body && document.body.innerText) || '').slice(0, 4000),
-          html: (document.documentElement && document.documentElement.outerHTML || '').slice(0, 30000),
-          imgs: document.images ? document.images.length : 0,
-        }));
+        const info = await page.evaluate(() => {
+          const body = document.body;
+          const text = (body && body.innerText) || '';
+          return {
+            title: document.title || '',
+            text: text.slice(0, 4000),
+            textLen: text.length,
+            html: (document.documentElement && document.documentElement.outerHTML || '').slice(0, 30000),
+            imgs: document.images ? document.images.length : 0,
+            links: document.querySelectorAll('a[href]').length,
+            // Elements that only exist on an actual challenge/interstitial page — never on a normal page
+            challengeWidget: !!document.querySelector(
+              '#px-captcha, .px-captcha, iframe[src*="captcha.px-cloud.net"], ' +           // PerimeterX / HUMAN
+              '#challenge-running, #challenge-form, #cf-challenge-running, #challenge-stage, ' + // Cloudflare interstitial
+              'iframe[src*="geo.captcha-delivery.com"], #ddv1-captcha-container, ' +       // DataDome
+              '#kpsdk-challenge, ' +                                                        // Kasada
+              'iframe[src*="_Incapsula_Resource?SWCGHOEL"], form[action*="_Incapsula_Resource"]' // Imperva challenge
+            ),
+          };
+        });
+
+        // A page with real content is not blocked, regardless of which anti-bot SDK it loads.
+        // Retailers ship PerimeterX/Akamai/Imperva sensors on every normal page — that is NOT a block.
+        const looksLikeRealPage = info.imgs >= 3 || info.links >= 15 || info.textLen > 2500;
+        if (looksLikeRealPage && !info.challengeWidget) return null;
+
         const blob = (info.title + ' ' + info.text + ' ' + info.html).toLowerCase();
-        if (/_incapsula_resource|incapsula|imperva/.test(blob))                                   return 'Imperva';
+        if (/_incapsula_resource|incapsula|imperva/.test(blob))                                    return 'Imperva';
         if (/cf-browser-verification|challenges\.cloudflare\.com|cf_chl_|just a moment|checking your browser|attention required/.test(blob)) return 'Cloudflare';
-        if (/akamaighost|errors\.edgesuite\.net|reference\s*#\s*[0-9a-f]+\.[0-9a-f]+/.test(blob) && info.imgs < 3) return 'Akamai';
-        if (/perimeterx|px-captcha|_pxhd|press\s*&\s*hold|human challenge/.test(blob))         return 'PerimeterX';
-        if (/datadome|geo\.captcha-delivery\.com/.test(blob))                                   return 'DataDome';
-        if (/kasada|kpsdk/.test(blob))                                                           return 'Kasada';
-        if (/shape security|shapesecurity/.test(blob))                                           return 'F5 Shape';
-        if (/access denied|request blocked|request unsuccessful|403 forbidden/.test(blob) && info.imgs < 3) return 'WAF';
+        if (/akamaighost|errors\.edgesuite\.net|reference\s*#\s*[0-9a-f]+\.[0-9a-f]+/.test(blob))  return 'Akamai';
+        if (/perimeterx|px-captcha|press\s*&\s*hold|human challenge|human verification/.test(blob)) return 'PerimeterX';
+        if (/datadome|geo\.captcha-delivery\.com/.test(blob))                                    return 'DataDome';
+        if (/kasada|kpsdk/.test(blob))                                                            return 'Kasada';
+        if (/shape security|shapesecurity/.test(blob))                                            return 'F5 Shape';
+        if (/access denied|request blocked|request unsuccessful|403 forbidden|pardon our interruption/.test(blob)) return 'WAF';
         return null;
       } catch { return null; }
     }
@@ -993,12 +1014,14 @@ async function crawlSite(browser, rawUrl) {
           const html = await r.text();
           console.log(`[HTML] ${r.status} ${html.length} bytes from ${r.url}`);
           const lower = html.toLowerCase();
-          if (!blockedBy) {
+          const imgTags = (html.match(/<img\b/gi) || []).length, aTags = (html.match(/<a\b/gi) || []).length;
+          const tinyPage = imgTags < 3 && aTags < 15 && html.length < 60000; // real pages are bigger than this
+          if (!blockedBy && tinyPage) {
             if (/_incapsula_resource|incapsula/.test(lower)) blockedBy = 'Imperva';
             else if (/cf-browser-verification|cf_chl_|just a moment/.test(lower)) blockedBy = 'Cloudflare';
             else if (/akamaighost|errors\.edgesuite\.net/.test(lower)) blockedBy = 'Akamai';
-            else if (/perimeterx|px-captcha/.test(lower)) blockedBy = 'PerimeterX';
-            else if (/datadome/.test(lower)) blockedBy = 'DataDome';
+            else if (/id="px-captcha"|press\s*&\s*hold|human verification/.test(lower)) blockedBy = 'PerimeterX';
+            else if (/geo\.captcha-delivery\.com/.test(lower)) blockedBy = 'DataDome';
           }
           const found = new Set();
           const base = new URL(r.url);
@@ -1025,15 +1048,138 @@ async function crawlSite(browser, rawUrl) {
     }
 
     // ── Helper: dismiss cookie banners ────────────────────────────────────────
-    async function dismissCookies() {
-      try {
-        await page.evaluate((texts) => {
-          for (const el of document.querySelectorAll('button, a, [role="button"]')) {
-            if (texts.includes(el.innerText?.toLowerCase().trim())) { el.click(); return; }
+    // ── Dismiss overlays: country selector (→ US), promo/newsletter modals,
+    //    age gates, cookie banners, then nuke any remaining full-screen backdrop.
+    //    Runs up to 3 passes because closing one popup often reveals the next.
+    async function dismissOverlays() {
+      const actions = [];
+      for (let pass = 0; pass < 3; pass++) {
+        let did = [];
+        try {
+          did = await page.evaluate((COOKIE_TEXTS) => {
+            const out = [];
+            const vis = el => {
+              if (!el || !(el instanceof Element)) return false;
+              const cs = getComputedStyle(el); if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return false;
+              const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0;
+            };
+            const txt = el => (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || el.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const inOverlay = el => !!el.closest('[role="dialog"],[aria-modal="true"],[class*="modal" i],[class*="popup" i],[class*="pop-up" i],[class*="overlay" i],[class*="lightbox" i],[class*="interstitial" i],[class*="geo" i],[class*="region" i],[class*="country" i],[class*="locale" i],[class*="welcome" i],[class*="newsletter" i],[class*="subscribe" i],[class*="promo" i],[class*="drawer" i],[id*="modal" i],[id*="popup" i],[id*="overlay" i],[id*="geo" i],[id*="country" i],[id*="region" i],[id*="locale" i],[id*="newsletter" i]');
+            const clickables = () => Array.from(document.querySelectorAll('button, a, [role="button"], [role="option"], li, label, input[type="submit"], input[type="button"], span, div')).filter(vis);
+
+            // 1) COUNTRY / REGION SELECTOR → United States
+            const usRe = /^(united states( of america)?|usa|u\.s\.a?\.?|us|united states - english|united states \(english\)|us - english|us \/ english|english \(us\)|english - us|en-us|us\s*\$|usd|\$ usd|us \(\$\)|united states \(\$\)|united states \(usd\)|shop in the us|go to us site|us site|continue to (the )?us site|stay on (this|us) site|continue to united states)$/i;
+            // 1a) <select> with a US option
+            for (const sel of Array.from(document.querySelectorAll('select')).filter(vis)) {
+              const opt = Array.from(sel.options).find(o => /^(us|usa|united states|united states of america|en[-_]us|us_en|en[-_]us\/?|usd)$/i.test((o.value||'').trim()) || /^united states/i.test((o.text||'').trim()));
+              if (opt && sel.value !== opt.value) {
+                sel.value = opt.value; sel.dispatchEvent(new Event('input', { bubbles: true })); sel.dispatchEvent(new Event('change', { bubbles: true }));
+                out.push('select→US');
+                const form = sel.closest('form'); const btn = form && Array.from(form.querySelectorAll('button, input[type="submit"]')).find(vis);
+                if (btn) { btn.click(); out.push('select-submit'); }
+                break;
+              }
+            }
+            // 1b) Clickable "United States" option inside an overlay (or a geo prompt anywhere)
+            if (!out.some(o => o.startsWith('select'))) {
+              const cands = clickables().filter(el => usRe.test(txt(el)) && (inOverlay(el) || el.closest('[class*="geo" i],[id*="geo" i],[class*="country" i],[class*="region" i],[class*="locale" i],[class*="market" i],[class*="shipping" i]')));
+              const pick = cands.find(el => el.matches('a[href*="/us/" i],a[href$="/us" i],a[href*="/us-en" i],a[href*="/en-us" i],a[href*="/en_us" i],a[href*="/us_en" i],a[href*="country=us" i],a[href*="locale=en_us" i],a[href*="region=us" i],a[href*="site=us" i]')) || cands[0];
+              if (pick) { (pick.closest('a,button,[role="button"],[role="option"],li,label') || pick).click(); out.push('country→US'); }
+            }
+            // 1c) Flag images for US
+            if (!out.length) {
+              const flag = Array.from(document.querySelectorAll('img[alt*="United States" i], img[alt="USA" i], img[alt="US" i], img[src*="/us.svg" i], img[src*="flag-us" i], img[src*="us-flag" i], [class*="flag-us" i], [class*="flag_us" i]')).filter(vis).find(inOverlay);
+              if (flag) { (flag.closest('a,button,[role="button"],li,label') || flag).click(); out.push('flag→US'); }
+            }
+
+            // 2) AGE GATE
+            const ageCtx = document.body.innerText.toLowerCase();
+            if (/are you (over|at least|21|18)|age verification|verify your age|must be (21|18)|date of birth|enter your birth|i am (over )?(21|18)/.test(ageCtx)) {
+              for (const sel of Array.from(document.querySelectorAll('select')).filter(vis)) {
+                const n = (sel.name + ' ' + sel.id + ' ' + (sel.getAttribute('aria-label')||'')).toLowerCase();
+                if (/year|yy|birth/.test(n)) { const o = Array.from(sel.options).find(o => /^19(8|9)\d$/.test(o.value) || /^19(8|9)\d$/.test(o.text)); if (o) { sel.value = o.value; sel.dispatchEvent(new Event('change', { bubbles: true })); out.push('age-year'); } }
+                else if (/month|mm/.test(n)) { const o = Array.from(sel.options).find(o => /^(0?1|jan)/i.test(o.value) || /^(0?1|jan)/i.test(o.text)); if (o) { sel.value = o.value; sel.dispatchEvent(new Event('change', { bubbles: true })); } }
+                else if (/day|dd/.test(n)) { const o = Array.from(sel.options).find(o => /^0?1$/.test(o.value) || /^0?1$/.test(o.text)); if (o) { sel.value = o.value; sel.dispatchEvent(new Event('change', { bubbles: true })); } }
+              }
+              for (const inp of Array.from(document.querySelectorAll('input[type="text"],input[type="number"],input[type="tel"]')).filter(vis)) {
+                const n = (inp.name + ' ' + inp.id + ' ' + (inp.placeholder||'')).toLowerCase();
+                const set = v => { inp.value = v; inp.dispatchEvent(new Event('input', { bubbles: true })); inp.dispatchEvent(new Event('change', { bubbles: true })); };
+                if (/year|yyyy/.test(n)) set('1990'); else if (/month|mm/.test(n)) set('01'); else if (/day|dd/.test(n)) set('01');
+              }
+              const ageBtn = clickables().find(el => /^(yes|yes[, ]+i am|yes[, ]+i'?m|i am (over )?(21|18)\+?|i'?m (over )?(21|18)\+?|i am of legal (drinking )?age|enter( site)?|confirm|verify|submit|continue|over (21|18))$/i.test(txt(el)));
+              if (ageBtn) { ageBtn.click(); out.push('age-gate'); }
+            }
+
+            // 3) PROMO / NEWSLETTER / GENERIC MODAL — decline or close
+            const declineRe = /^(no[, ]*thanks?( you)?|not now|maybe later|later|skip|dismiss|close|close dialog|close modal|close window|close popup|close this|no|nope|i'?ll pass|decline|continue without( saving)?|continue (to|on) (the )?site|continue to site|continue shopping|keep shopping|stay (here|on (this )?site)|remind me later|got it|×|✕|✖|x|⨯)$/i;
+            const closeSel = '[aria-label*="close" i],[aria-label*="dismiss" i],[title*="close" i],[data-dismiss],[data-close],[data-testid*="close" i],[data-test*="close" i],button[class*="close" i],a[class*="close" i],[class*="modal__close" i],[class*="modal-close" i],[class*="popup-close" i],[class*="btn-close" i],[class*="closeButton" i],[class*="close-button" i],[class*="dismiss" i],[id*="close" i],.mfp-close,.fancybox-close,.lity-close,.ltkpopup-close,.bx-close,.klaviyo-close-form,.needsclick[aria-label="Close"]';
+            let closed = 0;
+            for (const el of Array.from(document.querySelectorAll(closeSel)).filter(vis)) {
+              if (!inOverlay(el) && !/fixed|absolute/.test(getComputedStyle(el.parentElement||el).position)) continue;
+              el.click(); closed++; if (closed >= 2) break;
+            }
+            if (!closed) {
+              const btn = clickables().find(el => declineRe.test(txt(el)) && inOverlay(el));
+              if (btn) { btn.click(); closed++; }
+            }
+            if (closed) out.push('modal-close×' + closed);
+
+            // 4) COOKIE BANNER
+            for (const el of Array.from(document.querySelectorAll('button, a, [role="button"]')).filter(vis)) {
+              if (COOKIE_TEXTS.includes(txt(el))) { el.click(); out.push('cookie'); break; }
+            }
+            // common CMP ids
+            for (const id of ['onetrust-accept-btn-handler','truste-consent-button','CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll','didomi-notice-agree-button','accept-recommended-btn-handler','cookie-accept','cookieAccept','cc-accept','hs-eu-confirmation-button']) {
+              const el = document.getElementById(id); if (el && vis(el)) { el.click(); out.push('cmp:' + id); break; }
+            }
+            const cmpBtn = document.querySelector('.cc-btn.cc-allow, .cc-dismiss, .cky-btn-accept, .cmplz-accept, .osano-cm-accept-all, .iubenda-cs-accept-btn, .js-cookie-consent-agree, .cookie-consent-accept, #CybotCookiebotDialogBodyButtonAccept');
+            if (cmpBtn && vis(cmpBtn)) { cmpBtn.click(); out.push('cmp-btn'); }
+
+            return out;
+          }, COOKIE_TEXTS);
+        } catch { did = []; }
+
+        actions.push(...did);
+        // Also try close buttons inside iframes (Attentive, Privy, some Klaviyo/OneTrust variants)
+        try {
+          for (const f of page.frames()) {
+            if (f === page.mainFrame()) continue;
+            const r = await f.evaluate(() => {
+              const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).display !== 'none'; };
+              const el = Array.from(document.querySelectorAll('[aria-label*="close" i],[class*="close" i],[id*="close" i],button')).find(e => vis(e) && (/close|dismiss|no thanks|not now|×|✕/i.test(e.innerText || e.getAttribute('aria-label') || '')));
+              if (el) { el.click(); return true; } return false;
+            }).catch(() => false);
+            if (r) actions.push('iframe-close');
           }
-        }, COOKIE_TEXTS);
-        await new Promise(r => setTimeout(r, 500));
-      } catch { /* ignore */ }
+        } catch {}
+
+        if (!did.length) {
+          // Nothing clickable found — press Escape then strip any remaining full-screen backdrop
+          await page.keyboard.press('Escape').catch(() => {});
+          const nuked = await page.evaluate(() => {
+            let n = 0; const vw = innerWidth, vh = innerHeight;
+            for (const el of Array.from(document.querySelectorAll('body *'))) {
+              const cs = getComputedStyle(el); if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+              if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+              const r = el.getBoundingClientRect(); if (r.width < vw * 0.7 || r.height < vh * 0.7) continue;
+              if (parseInt(cs.zIndex || '0', 10) < 50) continue;
+              if (el.tagName === 'HEADER' || el.tagName === 'NAV' || el.tagName === 'MAIN' || el.closest('header,nav,main')) continue;
+              const idc = (el.id + ' ' + el.className + ' ' + (el.getAttribute('role')||'')).toLowerCase();
+              const looksLikeOverlay = /modal|popup|pop-up|overlay|backdrop|lightbox|interstitial|dialog|drawer|geo|country|region|newsletter|subscribe|promo|welcome|takeover|splash/.test(idc) || !!el.querySelector('[aria-label*="close" i],[class*="close" i]');
+              if (!looksLikeOverlay) continue;
+              el.style.setProperty('display', 'none', 'important'); n++;
+            }
+            for (const t of [document.documentElement, document.body]) { if (getComputedStyle(t).overflow === 'hidden') t.style.setProperty('overflow', 'auto', 'important'); }
+            for (const cls of ['modal-open','no-scroll','noscroll','overflow-hidden','popup-open','has-modal','is-locked','scroll-lock','ReactModal__Body--open']) document.body.classList.remove(cls);
+            return n;
+          }).catch(() => 0);
+          if (nuked) actions.push('backdrop-removed×' + nuked);
+          break;
+        }
+        await new Promise(r => setTimeout(r, 450));
+      }
+      if (actions.length) console.log(`[CDN] Overlays handled: ${actions.join(', ')}`);
+      await new Promise(r => setTimeout(r, 300));
     }
 
     // ── Helper: human-like scroll ─────────────────────────────────────────────
@@ -1226,7 +1372,6 @@ async function crawlSite(browser, rawUrl) {
 
     let lastNavError = null;
     let pagesScanned = 0;
-    let navFailReason = null;
 
     // ── Phase A: Load homepage to collect links ───────────────────────────────
     console.log(`[CDN] Loading homepage for inner page links: ${url}`);
@@ -1237,12 +1382,19 @@ async function crawlSite(browser, rawUrl) {
       effectiveUrl = page.url() || url;
       addTrustedRoot(effectiveUrl);
       if (effectiveUrl.replace(/\/$/, '') !== url.replace(/\/$/, '')) console.log(`[CDN] Redirected: ${url} → ${effectiveUrl}`);
-      await dismissCookies();
+
+      // Close country selector (→ US), promo/newsletter modals, age gates, cookie banners
+      await new Promise(r => setTimeout(r, 600)); // let late-firing popups mount first
+      await dismissOverlays();
+      // Choosing a country often reloads to /us/en — wait for it and re-read the URL
+      await page.waitForNetworkIdle({ idleTime: 500, timeout: 3000 }).catch(() => {});
+      if (page.url() && page.url() !== effectiveUrl) { effectiveUrl = page.url(); addTrustedRoot(effectiveUrl); console.log(`[CDN] After overlay dismissal → ${effectiveUrl}`); }
       await new Promise(r => setTimeout(r, AFTER_WAIT));
 
       // The homepage counts too — full DOM scan + scroll to trigger lazy images
       await scanDOMElements();
       await humanScroll(SCROLL_PX);
+      await dismissOverlays(); // scroll-depth / exit-intent popups show up now
       await page.waitForNetworkIdle({ idleTime: 500, timeout: 2500 }).catch(() => {});
       await scanDOMElements(); // second pass picks up lazy-loaded srcs
       console.log(`[CDN] Homepage scan — Network: ${networkImageCount}, DOM: ${domImageCount}, CDN: ${cdnFromUrl || 'none'}`);
@@ -1296,7 +1448,7 @@ async function crawlSite(browser, rawUrl) {
 
       try {
         await navigateTo(targetUrl);
-        await dismissCookies();
+        await dismissOverlays();
         await new Promise(r => setTimeout(r, AFTER_WAIT));
 
         // DOM scan — Elements tab equivalent
