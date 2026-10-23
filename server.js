@@ -29,6 +29,8 @@ const CDN_URL_PATTERNS = [
   ['gumlet.io',             'Gumlet'],
   ['gumlet',                'Gumlet'],
   ['scene7.com',            'Scene7 (Adobe DM)'],
+  ['scene7.net',            'Scene7 (Adobe DM)'],
+  ['.scene7.',              'Scene7 (Adobe DM)'],
   ['cloudimage.io',         'Cloudimage'],
   ['cloudimg.io',           'Cloudimage'],
   ['imageengine.io',        'ImageEngine'],
@@ -74,6 +76,7 @@ const CDN_URL_PATTERNS = [
   ['cdn.prod.website-files','Webflow CDN'],
   ['datocms-assets.com',    'DatoCMS CDN'],
   ['graphassets.com',       'Hygraph CDN'],
+  ['.graphassets.com',      'Hygraph CDN'],
   ['graphcms-assets.com',   'Hygraph CDN'],
   ['media.graphassets.com', 'Hygraph CDN'],
   ['assets.graphassets.com','Hygraph CDN'],
@@ -240,6 +243,109 @@ const CDN_PRIORITY = {
   'Nginx':1,'Apache':1,'LiteSpeed':1,'Varnish':1,
 };
 function getCDNPriority(name) { return CDN_PRIORITY[name] || 3; }
+
+// ── DNS CNAME patterns — identify CDN from DNS records (like dig) ────────────
+// Maps CNAME suffixes to CDN names — same as running dig on the domain
+const DNS_CDN_PATTERNS = [
+  // Akamai
+  ['edgekey.net',           'Akamai'],
+  ['edgesuite.net',         'Akamai'],
+  ['akamaiedge.net',        'Akamai'],
+  ['akamaihd.net',          'Akamai'],
+  ['akadns.net',            'Akamai'],
+  ['akamai.net',            'Akamai'],
+  ['akamaized.net',         'Akamai'],
+  // AWS CloudFront
+  ['cloudfront.net',        'AWS CloudFront'],
+  // Fastly
+  ['fastly.net',            'Fastly'],
+  ['fastlylb.net',          'Fastly'],
+  ['freetls.fastly.net',    'Fastly'],
+  // Cloudflare
+  ['cdn.cloudflare.net',    'Cloudflare'],
+  ['cloudflare.net',        'Cloudflare'],
+  // Azure
+  ['azureedge.net',         'Azure CDN'],
+  ['azurefd.net',           'Azure Front Door'],
+  ['trafficmanager.net',    'Azure Traffic Manager'],
+  ['azurewebsites.net',     'Azure'],
+  // Bunny CDN
+  ['b-cdn.net',             'Bunny CDN'],
+  // Imgix
+  ['imgix.net',             'Imgix'],
+  // Cloudinary
+  ['cloudinary.com',        'Cloudinary'],
+  // KeyCDN
+  ['kxcdn.com',             'KeyCDN'],
+  // CDN77
+  ['rsc.cdn77.org',         'CDN77'],
+  ['cdn77.org',             'CDN77'],
+  // Limelight / Edgio
+  ['llnwd.net',             'Limelight / Edgio'],
+  ['edgio.net',             'Edgio'],
+  ['cachefly.net',          'CacheFly'],
+  // Vercel
+  ['vercel.app',            'Vercel'],
+  ['vercel-dns.com',        'Vercel'],
+  // Netlify
+  ['netlify.app',           'Netlify'],
+  ['netlify.com',           'Netlify'],
+  // Shopify
+  ['myshopify.com',         'Shopify CDN'],
+  ['shopify.com',           'Shopify CDN'],
+  // Wix
+  ['wixdns.net',            'Wix CDN'],
+  // Squarespace
+  ['squarespace.com',       'Squarespace CDN'],
+  // StackPath
+  ['stackpathcdn.com',      'StackPath CDN'],
+  ['hwcdn.net',             'StackPath CDN'],
+  // Sucuri
+  ['sucuri.net',            'Sucuri / Cloudproxy'],
+  // Imperva
+  ['incapdns.net',          'Imperva CDN'],
+  // Verizon / Edgecast
+  ['edgecastcdn.net',       'Edgecast / Verizon'],
+  ['systemcdn.net',         'Edgecast / Verizon'],
+  // BrightEdge / others
+  ['georedirect.net',       'Geo Redirect CDN'],
+  ['zenedge.net',           'Oracle Dyn CDN'],
+];
+
+async function dnsLookupCDN(hostname) {
+  // Use Cloudflare DNS-over-HTTPS to resolve CNAME chain
+  // Same result as running: dig <hostname>
+  try {
+    hostname = hostname.replace(/^www\./, '');
+    const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=CNAME`;
+    const r = await fetch(url, {
+      headers: { 'Accept': 'application/dns-json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+
+    // Walk the CNAME chain
+    const answers = (data.Answer || []).filter(a => a.type === 5); // type 5 = CNAME
+    for (const ans of answers) {
+      const cname = (ans.data || '').toLowerCase().replace(/\.$/, '');
+      for (const [pattern, cdn] of DNS_CDN_PATTERNS) {
+        if (cname.endsWith(pattern.toLowerCase()) || cname.includes(pattern.toLowerCase())) {
+          console.log(`[DNS] ${hostname} → CNAME ${cname} → ${cdn}`);
+          return { cdn, cname };
+        }
+      }
+    }
+
+    // Also check A record response — some CDNs don't use CNAME but return known IPs
+    // Fall back: try the full chain with type=ANY
+    return null;
+  } catch (e) {
+    console.log(`[DNS] Lookup failed for ${hostname}: ${e.message}`);
+    return null;
+  }
+}
+
 
 // ── Detection helpers ─────────────────────────────────────────────────────────
 function detectCDNFromUrl(url) {
@@ -461,6 +567,8 @@ async function crawlSite(browser, rawUrl) {
   let done              = false;
 
   let cdnFromUrl   = null;
+  let cdnFromDNS   = null;  // CDN detected via DNS CNAME lookup
+  let cnameRecord  = null;  // raw CNAME chain from DNS
   let serverHeader = null;
   let serverCDN    = null;
   let damFromUrl   = null;
@@ -594,6 +702,16 @@ async function crawlSite(browser, rawUrl) {
     });
 
     await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
+
+    // ── DNS lookup — runs in parallel with page load ───────────────────────
+    // Resolves CNAME chain to identify CDN (like running dig on the domain)
+    const dnsPromise = dnsLookupCDN(new URL(url).hostname).then(result => {
+      if (result) {
+        cdnFromDNS  = result.cdn;
+        cnameRecord = result.cname;
+        console.log(`[DNS] CDN from CNAME: ${cdnFromDNS} (${cnameRecord})`);
+      }
+    }).catch(() => {});
     await page.setRequestInterception(true);
 
     const BLOCK_TYPES = new Set(['font','media','websocket','eventsource','manifest']);
@@ -676,9 +794,9 @@ async function crawlSite(browser, rawUrl) {
     async function navigateTo(targetUrl) {
       const attempts = [
         { url: targetUrl,                               opts: { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT } },
-        { url: targetUrl,                               opts: { waitUntil: 'commit',           timeout: 25000 } },
-        { url: targetUrl.replace(/^https:/i, 'http:'), opts: { waitUntil: 'domcontentloaded', timeout: 20000 } },
-        { url: targetUrl.replace(/^https:/i, 'http:'), opts: { waitUntil: 'commit',           timeout: 15000 } },
+        { url: targetUrl,                               opts: { waitUntil: 'load',             timeout: 20000 } },
+        { url: targetUrl.replace(/^https:/i, 'http:'), opts: { waitUntil: 'domcontentloaded', timeout: 18000 } },
+        { url: targetUrl.replace(/^https:/i, 'http:'), opts: { waitUntil: 'load',             timeout: 15000 } },
       ];
       let lastErr = null;
       for (const a of attempts) {
@@ -862,53 +980,40 @@ async function crawlSite(browser, rawUrl) {
     // MAIN CRAWL FLOW
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // ── STEP 1: Build candidate inner page URLs ──────────────────────────────
-    const baseUrl = new URL(url);
-    const origin  = baseUrl.origin;
+    // ── PAGE DISCOVERY AND SCAN ───────────────────────────────────────────────
+    // Strategy:
+    // 1. Load homepage — collect navigation links + any image signals
+    // 2. Extract all inner page links, score by image-richness priority
+    // 3. Load the top-scoring inner page and do full dual scan (Network + DOM)
+    // 4. If CDN not found, try a second inner page
 
-    const GUESSED_PATHS = [
-      '/products', '/shop', '/store', '/collections', '/category',
-      '/categories', '/catalogue', '/catalog', '/range', '/ranges',
-      '/portfolio', '/gallery', '/work', '/case-studies',
-      '/solutions', '/services', '/features', '/platform',
-      '/about', '/team', '/blog', '/news',
-    ];
-
-    // ── STEP 2: Probe candidates with HEAD check ──────────────────────────────
     let lastNavError = null;
     let pagesScanned = 0;
-    const MAX_PROBE   = 6;  // probe up to 6 paths
-    const MAX_SCAN    = 2;  // fully scan the best 2 pages
 
-    const validInnerPages = [];
-    for (const candidate of GUESSED_PATHS.map(p => origin + p).slice(0, MAX_PROBE)) {
-      try {
-        const check = await page.evaluate(async (checkUrl) => {
-          try {
-            const r = await fetch(checkUrl, { method: 'HEAD', redirect: 'follow' });
-            return r.ok;
-          } catch { return false; }
-        }, candidate).catch(() => false);
-        if (check) validInnerPages.push(candidate);
-      } catch { /* ignore */ }
+    // ── Phase A: Load homepage to collect links ───────────────────────────────
+    console.log(`[CDN] Loading homepage for inner page links: ${url}`);
+    let innerPages = [];
+
+    try {
+      await navigateTo(url);
+      await dismissCookies();
+      await new Promise(r => setTimeout(r, 500));
+
+      // Extract and score all inner page links
+      innerPages = await findInnerPages(url, 8);
+      console.log(`[CDN] Found ${innerPages.length} inner pages: ${innerPages.slice(0,4).join(', ')}`);
+
+      // Reset — don't count homepage images toward results
+      networkImageCount = 0;
+      domImageCount = 0;
+      // Keep server header + CDN signals from homepage if found — they're valid
+    } catch (e) {
+      lastNavError = e;
+      console.log(`[CDN] Homepage failed: ${e.message}`);
     }
 
-    // Fall back to homepage link extraction if no guessed paths work
-    if (validInnerPages.length === 0) {
-      console.log(`[CDN] No guessed paths — loading homepage for links`);
-      try {
-        await navigateTo(url);
-        await dismissCookies();
-        const found = await findInnerPages(url, MAX_PROBE);
-        validInnerPages.push(...found);
-        networkImageCount = 0;
-        domImageCount = 0;
-      } catch (e) { lastNavError = e; }
-    }
-
-    if (validInnerPages.length === 0 && !lastNavError) validInnerPages.push(url);
-
-    if (validInnerPages.length === 0 && lastNavError) {
+    // If homepage failed completely with no links found
+    if (innerPages.length === 0 && lastNavError && networkImageCount === 0) {
       const errMsg = lastNavError.message || 'Unknown error';
       const reason = errMsg.includes('CERT') || errMsg.includes('SSL')
         ? `SSL/Certificate error: ${errMsg}`
@@ -923,42 +1028,15 @@ async function crawlSite(browser, rawUrl) {
       return { cdnFromUrl: 'Not available', server: '', damFromUrl: 'Not available', techStack: '', matchedUrl: '', confidence: 'Low', detail: reason, reason };
     }
 
-    // ── STEP 3: Quick-scan each candidate to count images — pick richest ──────
-    // Load each candidate, count how many content images it has, then
-    // fully scan the page with the MOST images for best CDN detection
-    console.log(`[CDN] Probing ${validInnerPages.length} pages to find image-richest`);
+    // ── Phase B: Full scan of top inner pages ────────────────────────────────
+    // If no inner pages found, scan homepage itself as fallback
+    const pagesToFullScan = innerPages.length > 0 ? innerPages.slice(0, 3) : [url];
 
-    const pageImageCounts = {}; // { url: count }
-
-    for (const candidatePage of validInnerPages) {
-      if (done) break;
-      try {
-        let imgCountBefore = networkImageCount;
-        await navigateTo(candidatePage);
-        await new Promise(r => setTimeout(r, 600)); // brief wait for images to start
-        // Quick DOM count (fast — no full scan yet)
-        const quickCount = await page.evaluate(() => {
-          return document.querySelectorAll('img[src], img[data-src], img[data-lazy-src]').length;
-        }).catch(() => 0);
-        const networkGain = networkImageCount - imgCountBefore;
-        pageImageCounts[candidatePage] = quickCount + networkGain;
-        console.log(`[CDN] ${candidatePage} → ~${pageImageCounts[candidatePage]} images`);
-      } catch { pageImageCounts[candidatePage] = 0; }
-    }
-
-    // Sort by image count — richest pages first
-    const rankedPages = validInnerPages
-      .sort((a, b) => (pageImageCounts[b] || 0) - (pageImageCounts[a] || 0))
-      .slice(0, MAX_SCAN);
-
-    console.log(`[CDN] Richest pages: ${rankedPages.map(p => p + '(' + pageImageCounts[p] + ')').join(', ')}`);
-
-    // ── STEP 4: Full scan of the richest page(s) ─────────────────────────────
-    for (let pageIdx = 0; pageIdx < rankedPages.length; pageIdx++) {
+    for (let pageIdx = 0; pageIdx < pagesToFullScan.length; pageIdx++) {
       if (done) break;
 
-      const targetUrl = rankedPages[pageIdx];
-      console.log(`[CDN] Full scan of page ${pageIdx + 1}: ${targetUrl}`);
+      const targetUrl = pagesToFullScan[pageIdx];
+      console.log(`[CDN] Full scan ${pageIdx + 1}/${pagesToFullScan.length}: ${targetUrl}`);
       pagesScanned++;
 
       try {
@@ -966,24 +1044,24 @@ async function crawlSite(browser, rawUrl) {
         await dismissCookies();
         await new Promise(r => setTimeout(r, AFTER_WAIT));
 
-        // DOM scan (Elements tab)
+        // DOM scan — Elements tab equivalent
         await scanDOMElements();
 
-        // Scroll to trigger lazy images (Network tab captures these)
+        // Scroll — triggers lazy images captured by Network tab listener
         await humanScroll(SCROLL_PX);
 
         await new Promise(r => setTimeout(r, 500));
 
-        console.log(`[CDN] Full scan done — Network: ${networkImageCount}, DOM: ${domImageCount}, CDN: ${cdnFromUrl || 'none yet'}`);
+        console.log(`[CDN] Scan ${pageIdx + 1} done — Network: ${networkImageCount}, DOM: ${domImageCount}, CDN: ${cdnFromUrl || 'none'}`);
 
       } catch (e) {
-        console.log(`[CDN] Full scan failed: ${e.message}`);
+        console.log(`[CDN] Scan ${pageIdx + 1} failed: ${e.message} — trying next`);
         continue;
       }
 
-      // Stop early if high-confidence CDN found
+      // Stop early if high-confidence CDN found with a real URL
       if (done || (cdnFromUrl && getCDNPriority(cdnFromUrl) >= 8 && matchedUrl)) {
-        console.log(`[CDN] High-confidence CDN found — stopping`);
+        console.log(`[CDN] High-confidence CDN found after ${pagesScanned} pages — stopping`);
         break;
       }
     }
@@ -998,6 +1076,7 @@ async function crawlSite(browser, rawUrl) {
   }
 
   await page.close().catch(() => {});
+  await dnsPromise; // ensure DNS lookup is complete
 
   // ── Score and build result ────────────────────────────────────────────────
   const totalImages = networkImageCount + domImageCount;
@@ -1013,15 +1092,19 @@ async function crawlSite(browser, rawUrl) {
     console.log(`[CDN] Majority endpoint: ${majorityEP.host} (${majorityEP.count} images)${majorityHostCDN ? ' → ' + majorityHostCDN : ''}`);
   }
 
-  // Priority: majority endpoint CDN > URL CDN > server CDN
-  // But respect the priority score system — don't let a low-priority
-  // majority override a high-priority explicit match
+  // Priority: URL/majority CDN > DNS CDN > server CDN
+  // URL-based detection is most accurate; DNS is a strong fallback
   let finalCDN;
   if (majorityHostCDN && cdnFromUrl) {
     finalCDN = getCDNPriority(majorityHostCDN) >= getCDNPriority(cdnFromUrl)
       ? majorityHostCDN : cdnFromUrl;
   } else {
     finalCDN = majorityHostCDN || cdnFromUrl || serverCDN || 'Not available';
+  }
+  // DNS CDN fills in when HTTP methods found nothing
+  if (finalCDN === 'Not available' && cdnFromDNS) {
+    finalCDN = cdnFromDNS;
+    console.log(`[DNS] Using DNS CDN as fallback: ${finalCDN}`);
   }
 
   const finalDAM = damFromUrl || 'Not available';
@@ -1067,6 +1150,8 @@ async function crawlSite(browser, rawUrl) {
     damFromUrl:  finalDAM,
     techStack:   techStackFinal,
     matchedUrl:  finalUrl,
+    cdnFromDNS:  cdnFromDNS   || '',
+    cnameRecord: cnameRecord   || '',
     confidence,
     detail,
     reason,
