@@ -404,7 +404,7 @@ async function writeToSheet(sheetId,updates){
 // ── Per-company polling with auto-restart on timeout ─────────────────────────
 const CONCURRENCY = 6; // parallel crawls — matches server PARALLEL
 const MAX_RETRIES_PER_COMPANY = 1; // only 1 retry — don't waste time
-const COMPANY_TIMEOUT_MS = 30000; // 30s per company (was 60s)
+const COMPANY_TIMEOUT_MS = 55000; // 55s per company — server budgets ~26s crawl + DNS + HTML fallback
 const RETRY_DELAY_MS = 500;       // 0.5s between retries (was 3s)
 
 const MAX_AUTO_RESTARTS = 5;
@@ -420,15 +420,25 @@ async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
   const remaining = () => allEntries.filter(e => !completedIndices.has(e.index) && !stopRequested);
 
   async function runBatch(entries) {
-    const queue = [...entries];
-    let done = 0;
+    // Group rows by normalized URL — scan each site once, write result to every matching row
+    const normKey = u => String(u || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/+$/, "");
+    const groups = new Map();
+    for (const e of entries) {
+      const k = normKey(e.url);
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(e);
+    }
+    const queue = [...groups.values()];
+    const dupCount = entries.length - queue.length;
+    if (dupCount > 0) log(`${dupCount} duplicate URL rows — scanning ${queue.length} unique sites, results copied to all rows`, 'info');
 
     async function worker() {
       while (queue.length > 0 && !stopRequested) {
-        const entry = queue.shift();
-        if (!entry) return;
+        const group = queue.shift();
+        if (!group || !group.length) return;
+        const entry = group[0];
 
-        onProgress({ index: entry.index, company: entry.company, website: entry.url });
+        for (const g of group) onProgress({ index: g.index, company: g.company, website: g.url });
 
         let result;
         let retries = 0;
@@ -458,8 +468,10 @@ async function crawlAll(serverUrl, allEntries, onProgress, onResult) {
           }
         }
 
-        completedIndices.add(entry.index);
-        onResult({ index: entry.index, company: entry.company, website: entry.url, ...result, done: completedIndices.size, total: allEntries.length });
+        for (const g of group) {
+          completedIndices.add(g.index);
+          onResult({ index: g.index, company: g.company, website: g.url, ...result, done: completedIndices.size, total: allEntries.length });
+        }
       }
     }
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, entries.length) }, () => worker()));
