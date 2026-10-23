@@ -73,6 +73,16 @@ const CDN_URL_PATTERNS = [
   ['webflow.com',           'Webflow CDN'],
   ['cdn.prod.website-files','Webflow CDN'],
   ['datocms-assets.com',    'DatoCMS CDN'],
+  ['graphassets.com',       'Hygraph CDN'],
+  ['graphcms-assets.com',   'Hygraph CDN'],
+  ['media.graphassets.com', 'Hygraph CDN'],
+  ['assets.graphassets.com','Hygraph CDN'],
+  ['hygraph.com',           'Hygraph CDN'],
+  ['graphcms.com',          'GraphCMS CDN'],
+  ['bfldr.com',             'Brandfolder CDN'],
+  ['images.unsplash.com',   'Unsplash CDN'],
+  ['cdn.prod.website-files.com','Webflow CDN'],
+  ['assets.website-files.com', 'Webflow CDN'],
   ['cdn77.org',             'CDN77'],
   ['edgecastcdn.net',       'Edgecast CDN'],
   ['limelight.com',         'Limelight CDN'],
@@ -200,6 +210,8 @@ const SERVER_PATTERNS = [
   ['scene7',        'Scene7'],
   ['cloudflare',    'Cloudflare'],
   ['cloudfront',    'AWS CloudFront'],
+  ['cloudfront.net','AWS CloudFront'],
+  ['(cloudfront)',  'AWS CloudFront'],
   ['akamai',        'Akamai'],
   ['fastly',        'Fastly'],
   ['bunny',         'Bunny CDN'],
@@ -267,7 +279,18 @@ function detectFromServerHeader(headers = {}) {
 }
 
 function extractServerHeader(headers = {}) {
-  return headers['server'] || headers['x-server'] || headers['x-served-by'] || null;
+  // Build a meaningful server string from all relevant headers
+  // This is what shows in the Server column in the sheet
+  const parts = [];
+  if (headers['server'])        parts.push(headers['server']);
+  if (headers['x-server'])      parts.push(headers['x-server']);
+  if (headers['x-served-by'])   parts.push(headers['x-served-by']);
+  // Via often contains the real CDN: "1.1 59baab.cloudfront.net (CloudFront)"
+  if (headers['via'])           parts.push(headers['via']);
+  // X-Cache tells us hit/miss and from which CDN: "Hit from cloudfront"
+  if (headers['x-cache'])       parts.push(headers['x-cache']);
+  if (headers['x-cdn'])         parts.push(headers['x-cdn']);
+  return parts.length > 0 ? parts.join(' | ') : null;
 }
 
 function normalise(raw) {
@@ -288,26 +311,116 @@ function isContentImage(url = '', ct = '') {
   return isImgCT(ct) || IMAGE_EXTENSIONS.test(url);
 }
 
-// ── Excluded URLs (bot challenges, trackers, etc.) ────────────────────────────
+// ── Excluded URLs ────────────────────────────────────────────────────────────
+// Block: bot challenges, trackers, ad pixels, social media pixels,
+// third-party analytics — anything that doesn't belong to the target site
 const EXCLUDED_URL_PATTERNS = [
+  // Cloudflare bot protection
   /challenges\.cloudflare\.com/i,
   /cdn-cgi\/challenge/i,
   /cdn-cgi\//i,
-  /pixel\.wp\.com\/g\.gif/i,
+  /cdnjs\.cloudflare\.com/i,
+  // Tracking pixels & analytics
   /google-analytics\.com/i,
   /googletagmanager\.com/i,
+  /\.wp\.com\/g\.gif/i,
   /\/beacon\./i,
-  /g\.gif\?/i,
+  /\/track\//i,
+  /\/pixel\//i,
+  /\/collect\?/i,
+  /g\.gif/i,
   /spacer\.gif/i,
   /blank\.gif/i,
   /pixel\.gif/i,
   /1x1\.gif/i,
   /\/favicon\.ico/i,
-  /cdnjs\.cloudflare\.com/i,
+  // LinkedIn trackers
+  /px\.ads\.linkedin\.com/i,
+  /linkedin\.com\/px/i,
+  /\/li\.lms-analytics/i,
+  /snap\.licdn\.com/i,
+  // Social media pixels
+  /facebook\.com\/tr/i,
+  /connect\.facebook\.net/i,
+  /\.fbcdn\.net/i,
+  /t\.co\/i/i,
+  /analytics\.twitter\.com/i,
+  /ct\.pinterest\.com/i,
+  /sc-static\.net/i,
+  /tiktok\.com/i,
+  // HubSpot / marketing trackers
   /hubspot\.com\/__ptq/i,
   /track\.hubspot/i,
+  /js\.hs-analytics\.net/i,
+  /\.hubspot\.com/i,
+  // Ad networks
+  /doubleclick\.net/i,
+  /googlesyndication\.com/i,
+  /googleadservices\.com/i,
+  /adsystem\.com/i,
+  /amazon-adsystem\.com/i,
+  /moatads\.com/i,
+  /criteo\.com/i,
+  /adnxs\.com/i,
+  /rubiconproject\.com/i,
+  /pubmatic\.com/i,
+  /openx\.net/i,
+  /insight_tag_errors/i,
+  // Other third-party tracking
+  /\.hotjar\.com/i,
+  /\.segment\.com/i,
+  /\.amplitude\.com/i,
+  /\.mixpanel\.com/i,
+  /\.intercom\.io/i,
+  /\.clarity\.ms/i,
+  /bat\.bing\.com/i,
+  /\.omtrdc\.net/i,     // Adobe Analytics
+  /\.demdex\.net/i,     // Adobe Audience Manager
+  /\/v1\/rum/i,         // Real User Monitoring pixels
 ];
 function isExcludedUrl(url) { return EXCLUDED_URL_PATTERNS.some(p => p.test(url)); }
+
+// ── Third-party domain filter ─────────────────────────────────────────────────
+// Only trust image URLs that plausibly belong to the target site:
+// - Same root domain (ashleyfurniture.com → ashley*.com subdomains)
+// - OR a recognised CDN/DAM pattern (imgix, cloudinary, graphassets etc.)
+// This prevents ad pixels, LinkedIn trackers, social embeds from being counted
+const ALWAYS_TRUSTED_CDN_HOSTS = [
+  'imgix.net','cloudinary.com','imagekit.io','gumlet.io','scene7.com',
+  'cloudimage.io','imageengine.io','sirv.com','twicpics.com','fastly.net',
+  'akamaized.net','cloudfront.net','amazonaws.com','azureedge.net',
+  'azurefd.net','windows.net','b-cdn.net','bunnycdn.com','bunny.net',
+  'kxcdn.com','ucarecdn.com','shopify.com','shopifycdn.com',
+  'squarespace-cdn.com','sqspcdn.com','wixstatic.com','wp.com',
+  'ctfassets.net','sanity.io','storyblok.com','prismic.io',
+  'datocms-assets.com','graphassets.com','graphcms-assets.com',
+  'hygraph.com','framerusercontent.com','webflow.com','website-files.com',
+  'googleusercontent.com','googleapis.com','firebasestorage.googleapis.com',
+];
+
+function isFromTrustedOrSameDomain(imgUrl, targetUrl) {
+  try {
+    const imgHost    = new URL(imgUrl).hostname.toLowerCase();
+    const targetHost = new URL(targetUrl).hostname.toLowerCase();
+
+    // Get root domain (last 2 parts: ashleyfurniture.com, not www.)
+    const getRootDomain = h => h.split('.').slice(-2).join('.');
+    const targetRoot = getRootDomain(targetHost);
+    const imgRoot    = getRootDomain(imgHost);
+
+    // Same root domain — always trust
+    if (imgRoot === targetRoot) return true;
+
+    // Known CDN/image delivery host — always trust
+    if (ALWAYS_TRUSTED_CDN_HOSTS.some(cdn => imgHost.endsWith(cdn))) return true;
+
+    // img host contains target brand name (e.g. "ashley" in "us-east-1-ashley.graphassets.com")
+    const brand = targetRoot.split('.')[0].replace(/-/g, '');
+    if (brand.length > 3 && imgHost.includes(brand)) return true;
+
+    return false;
+  } catch { return false; }
+}
 
 // ── Cookie texts ──────────────────────────────────────────────────────────────
 const COOKIE_TEXTS = [
@@ -385,6 +498,11 @@ async function crawlSite(browser, rawUrl) {
   // ── Process a single image URL (shared between DOM and Network scans) ─────
   function processImageUrl(imgUrl, source) {
     if (!imgUrl || isExcludedUrl(imgUrl)) return;
+
+    // ── Domain trust filter — only process images from the target site or known CDNs ──
+    // Blocks LinkedIn pixels, Facebook trackers, ad networks, social embeds
+    if (!isFromTrustedOrSameDomain(imgUrl, url)) return;
+
     // DOM scan: only keep jpg/jpeg/png/webp/avif — no SVG/GIF/ICO
     if (source === 'dom') {
       if (!/\.(jpe?g|png|webp|avif)(\?|$|#)/i.test(imgUrl)) return;
@@ -511,9 +629,12 @@ async function crawlSite(browser, rawUrl) {
         // Only process real content images (JPEG/PNG/WebP/AVIF) — skip SVG/GIF/ICO
         const isRealImage = (rt === 'image' || isContentImage(resUrl, ct));
         if (!isRealImage || status < 200 || status >= 400) return;
-        // Extra filter: skip obvious logos/icons/sprites from URL
+        // Extra filter: skip logos/icons/sprites
         if (/logo|icon|sprite|favicon|badge|flag|arrow|bullet|avatar/i.test(resUrl) &&
             !/product|photo|image|img|banner|hero|background/i.test(resUrl)) return;
+
+        // Domain trust filter — skip third-party trackers, ad pixels, social embeds
+        if (!isFromTrustedOrSameDomain(resUrl, url)) return;
 
         networkImageCount++;
         if (networkImageCount > MAX_IMAGES) {
