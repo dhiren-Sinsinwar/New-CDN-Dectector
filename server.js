@@ -313,49 +313,50 @@ const DNS_CDN_PATTERNS = [
   ['zenedge.net',           'Oracle Dyn CDN'],
 ];
 
+// Use Node's built-in DNS resolver — works inside Fly.io without outbound HTTP restrictions
+const dnsModule = require('dns').promises;
+
 async function dnsLookupCDN(hostname) {
-  // Use DNS-over-HTTPS to resolve CNAME chain (same as: dig <hostname>)
   hostname = hostname.replace(/^www\./, '');
-  console.log(`[DNS] Looking up CNAME for: ${hostname}`);
+  console.log(`[DNS] Resolving CNAME for: ${hostname}`);
 
-  // Try Cloudflare DoH first, then Google DoH as fallback
-  const endpoints = [
-    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=CNAME`,
-    `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=CNAME`,
-  ];
+  // Walk the full CNAME chain using Node dns.resolveCname
+  // This is equivalent to: dig CNAME <hostname>
+  try {
+    let current = hostname;
+    const chain = [];
+    const seen = new Set();
 
-  for (const url of endpoints) {
-    try {
-      const r = await fetch(url, {
-        headers: { 'Accept': 'application/dns-json' },
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!r.ok) {
-        console.log(`[DNS] HTTP ${r.status} from ${new URL(url).hostname}`);
-        continue;
-      }
-      const data = await r.json();
-
-      const answers = (data.Answer || []).filter(a => a.type === 5); // CNAME = type 5
-      if (answers.length === 0) {
-        console.log(`[DNS] No CNAME records for ${hostname}`);
-        break; // No point trying fallback
-      }
-
-      for (const ans of answers) {
-        const cname = (ans.data || '').toLowerCase().replace(/\.$/, '');
+    // Follow CNAME chain up to 10 hops
+    for (let i = 0; i < 10; i++) {
+      if (seen.has(current)) break;
+      seen.add(current);
+      try {
+        const cnames = await dnsModule.resolveCname(current);
+        if (!cnames || cnames.length === 0) break;
+        const next = cnames[0].toLowerCase().replace(/\.$/, '');
+        chain.push(next);
+        // Check this CNAME against patterns
         for (const [pattern, cdn] of DNS_CDN_PATTERNS) {
-          if (cname.endsWith(pattern.toLowerCase()) || cname.includes(pattern.toLowerCase())) {
-            console.log(`[DNS] ✅ ${hostname} → ${cname} → ${cdn}`);
-            return { cdn, cname };
+          if (next.endsWith(pattern.toLowerCase()) || next.includes(pattern.toLowerCase())) {
+            console.log(`[DNS] ✅ ${hostname} → ${chain.join(' → ')} → ${cdn}`);
+            return { cdn, cname: chain.join(' → ') };
           }
         }
-        console.log(`[DNS] CNAME found but no CDN match: ${cname}`);
+        current = next;
+      } catch (e) {
+        // ENODATA = no CNAME at this hop, end of chain
+        break;
       }
-      break; // Got a valid response, no fallback needed
-    } catch (e) {
-      console.log(`[DNS] Error: ${e.message}`);
     }
+
+    if (chain.length > 0) {
+      console.log(`[DNS] Chain found but no CDN match: ${hostname} → ${chain.join(' → ')}`);
+    } else {
+      console.log(`[DNS] No CNAME chain for: ${hostname}`);
+    }
+  } catch (e) {
+    console.log(`[DNS] Error resolving ${hostname}: ${e.message}`);
   }
   return null;
 }
