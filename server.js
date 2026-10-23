@@ -76,6 +76,7 @@ const CDN_URL_PATTERNS = [
   ['cdn.prod.website-files','Webflow CDN'],
   ['datocms-assets.com',    'DatoCMS CDN'],
   ['graphassets.com',       'Hygraph CDN'],
+  ['arthrex.io',            'Cloudinary'],   // cdn.arthrex.io is Cloudinary
   ['.graphassets.com',      'Hygraph CDN'],
   ['graphcms-assets.com',   'Hygraph CDN'],
   ['media.graphassets.com', 'Hygraph CDN'],
@@ -313,37 +314,50 @@ const DNS_CDN_PATTERNS = [
 ];
 
 async function dnsLookupCDN(hostname) {
-  // Use Cloudflare DNS-over-HTTPS to resolve CNAME chain
-  // Same result as running: dig <hostname>
-  try {
-    hostname = hostname.replace(/^www\./, '');
-    const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=CNAME`;
-    const r = await fetch(url, {
-      headers: { 'Accept': 'application/dns-json' },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!r.ok) return null;
-    const data = await r.json();
+  // Use DNS-over-HTTPS to resolve CNAME chain (same as: dig <hostname>)
+  hostname = hostname.replace(/^www\./, '');
+  console.log(`[DNS] Looking up CNAME for: ${hostname}`);
 
-    // Walk the CNAME chain
-    const answers = (data.Answer || []).filter(a => a.type === 5); // type 5 = CNAME
-    for (const ans of answers) {
-      const cname = (ans.data || '').toLowerCase().replace(/\.$/, '');
-      for (const [pattern, cdn] of DNS_CDN_PATTERNS) {
-        if (cname.endsWith(pattern.toLowerCase()) || cname.includes(pattern.toLowerCase())) {
-          console.log(`[DNS] ${hostname} → CNAME ${cname} → ${cdn}`);
-          return { cdn, cname };
-        }
+  // Try Cloudflare DoH first, then Google DoH as fallback
+  const endpoints = [
+    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=CNAME`,
+    `https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=CNAME`,
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const r = await fetch(url, {
+        headers: { 'Accept': 'application/dns-json' },
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!r.ok) {
+        console.log(`[DNS] HTTP ${r.status} from ${new URL(url).hostname}`);
+        continue;
       }
-    }
+      const data = await r.json();
 
-    // Also check A record response — some CDNs don't use CNAME but return known IPs
-    // Fall back: try the full chain with type=ANY
-    return null;
-  } catch (e) {
-    console.log(`[DNS] Lookup failed for ${hostname}: ${e.message}`);
-    return null;
+      const answers = (data.Answer || []).filter(a => a.type === 5); // CNAME = type 5
+      if (answers.length === 0) {
+        console.log(`[DNS] No CNAME records for ${hostname}`);
+        break; // No point trying fallback
+      }
+
+      for (const ans of answers) {
+        const cname = (ans.data || '').toLowerCase().replace(/\.$/, '');
+        for (const [pattern, cdn] of DNS_CDN_PATTERNS) {
+          if (cname.endsWith(pattern.toLowerCase()) || cname.includes(pattern.toLowerCase())) {
+            console.log(`[DNS] ✅ ${hostname} → ${cname} → ${cdn}`);
+            return { cdn, cname };
+          }
+        }
+        console.log(`[DNS] CNAME found but no CDN match: ${cname}`);
+      }
+      break; // Got a valid response, no fallback needed
+    } catch (e) {
+      console.log(`[DNS] Error: ${e.message}`);
+    }
   }
+  return null;
 }
 
 
@@ -938,13 +952,31 @@ async function crawlSite(browser, rawUrl) {
     async function findInnerPages(baseUrl, limit = 3) {
       try {
         const base = new URL(baseUrl);
-        const links = await page.evaluate((origin) => {
+        // Get root domain — e.g. amway.com from www.amway.com
+        // This way links work even when homepage redirects to www subdomain
+        const rootDomain = base.hostname.replace(/^www\./, '');
+
+        const links = await page.evaluate((rootDomain) => {
+          const currentRoot = window.location.hostname.replace(/^www\./, '');
           return Array.from(document.querySelectorAll('a[href]'))
-            .map(a => { try { return new URL(a.href, window.location.href).href; } catch { return null; } })
-            .filter(h => h && h.startsWith(origin))
+            .map(a => {
+              try {
+                const url = new URL(a.href, window.location.href);
+                return url.href;
+              } catch { return null; }
+            })
+            .filter(h => {
+              if (!h) return false;
+              try {
+                const u = new URL(h);
+                // Accept same root domain (with or without www, or subdomains)
+                const hRoot = u.hostname.replace(/^www\./, '');
+                return hRoot === rootDomain || hRoot.endsWith('.' + rootDomain);
+              } catch { return false; }
+            })
             .filter((v, i, a) => a.indexOf(v) === i)
-            .slice(0, 100);
-        }, base.origin);
+            .slice(0, 150);
+        }, rootDomain);
 
         // Score and sort links
         const scored = [];
